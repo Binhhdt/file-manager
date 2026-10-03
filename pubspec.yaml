@@ -12,6 +12,8 @@ dependencies:
   permission_handler: ^11.3.1
   open_filex: ^4.5.0
   path: ^1.9.0
+  archive: ^3.6.1
+  share_plus: ^10.1.4
   shared_preferences: ^2.3.2
   video_player: ^2.9.2
   fc_native_video_thumbnail: any
