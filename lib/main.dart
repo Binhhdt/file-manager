@@ -358,12 +358,28 @@ Widget fileIcon(Item it, {double size = 42}) {
 
 const nativeCh = MethodChannel('fm/native');
 
+/// Dau chon nho o goc o hinh.
+Widget tickMark(bool on) => Container(
+      width: 22,
+      height: 22,
+      decoration: BoxDecoration(shape: BoxShape.circle, color: on ? const Color(0xFF43B649) : Colors.black26, border: Border.all(color: Colors.white, width: 1.5)),
+      child: on ? const Icon(Icons.check, size: 15, color: Colors.white) : null,
+    );
+
+/// Anh vuong lap day o, dung cho luoi hinh va video.
+Widget mediaThumb(String path, double s) {
+  final c = catOf(path);
+  if (c?.name == 'Video') return VideoThumb(key: ValueKey(path), path: path, size: s, square: true);
+  return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.image, size: s * 0.5, color: c?.color ?? Colors.grey)));
+}
+
 /// Anh thu nho cho video hoac icon cua tap tin APK, tao bang ma Android goc.
 class VideoThumb extends StatefulWidget {
   final String path;
   final double size;
   final bool apk;
-  const VideoThumb({super.key, required this.path, required this.size, this.apk = false});
+  final bool square;
+  const VideoThumb({super.key, required this.path, required this.size, this.apk = false, this.square = false});
   @override
   State<VideoThumb> createState() => _VideoThumbState();
 }
@@ -413,10 +429,10 @@ class _VideoThumbState extends State<VideoThumb> {
         final img = Image.file(File(snap.data!), width: s, height: s, fit: widget.apk ? BoxFit.contain : BoxFit.cover, errorBuilder: (_, __, ___) => fallback);
         if (widget.apk) return img;
         return ClipRRect(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(widget.square ? 0 : 8),
           child: Stack(alignment: Alignment.center, children: [
             img,
-            Container(decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle), child: Icon(Icons.play_arrow, color: Colors.white, size: s * 0.45)),
+            Container(decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle), child: Icon(Icons.play_arrow, color: Colors.white, size: s * (widget.square ? 0.3 : 0.45))),
           ]),
         );
       },
@@ -704,7 +720,8 @@ class _BrowserState extends State<BrowserPage> {
   bool loading = true;
   final sel = <String>{};
   String q = '';
-  String sort = prefs.getString('sort') ?? 'name';
+  bool get _media => widget.mode == Mode.cat && (widget.cat?.name == 'Hình' || widget.cat?.name == 'Video');
+  late String sort = _media ? 'date' : (prefs.getString('sort') ?? 'name');
   bool grid = prefs.getBool('grid') ?? true;
   bool hidden = prefs.getBool('hidden') ?? false;
 
@@ -1156,6 +1173,26 @@ class _BrowserState extends State<BrowserPage> {
         Mode.search: q.isEmpty ? 'Nhập tên rồi nhấn tìm.' : 'Không tìm thấy kết quả nào.',
       }[widget.mode]!;
       body = Center(child: Text(t, style: const TextStyle(color: Colors.grey)));
+    } else if (grid && _media) {
+      body = GridView.builder(
+        padding: const EdgeInsets.only(bottom: 90),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, crossAxisSpacing: 2, mainAxisSpacing: 2),
+        itemCount: items.length,
+        itemBuilder: (_, i) {
+          final it = items[i], on = sel.contains(it.e.path);
+          return InkWell(
+            onTap: () => _tap(it),
+            onLongPress: () => setState(() => sel.add(it.e.path)),
+            child: LayoutBuilder(
+              builder: (_, c) => Stack(fit: StackFit.expand, children: [
+                mediaThumb(it.e.path, c.maxWidth),
+                if (on) Container(color: Colors.black26),
+                if (selecting) Positioned(right: 6, bottom: 6, child: tickMark(on)),
+              ]),
+            ),
+          );
+        },
+      );
     } else if (grid) {
       body = GridView.builder(
         padding: const EdgeInsets.fromLTRB(8, 8, 8, 90),
@@ -1171,7 +1208,14 @@ class _BrowserState extends State<BrowserPage> {
               padding: const EdgeInsets.all(3),
               child: Column(mainAxisAlignment: MainAxisAlignment.start, children: [
                 const SizedBox(height: 4),
-                on ? const Icon(Icons.check_circle, size: 66, color: blue) : fileIcon(it, size: 66),
+                SizedBox(
+                  width: 66,
+                  height: 66,
+                  child: Stack(children: [
+                    fileIcon(it, size: 66),
+                    if (selecting) Positioned(right: 0, bottom: 0, child: tickMark(on)),
+                  ]),
+                ),
                 const SizedBox(height: 6),
                 Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12.5, height: 1.2)),
               ]),
@@ -1278,7 +1322,7 @@ class _BrowserState extends State<BrowserPage> {
                         _load();
                       } else {
                         sort = v;
-                        prefs.setString('sort', v);
+                        if (!_media) prefs.setString('sort', v);
                         _load();
                       }
                     },
@@ -1775,12 +1819,14 @@ class _MediaCatState extends State<MediaCatPage> {
   }
 
   Future<void> _load() async {
-    final fs = (await scan()).where((e) => widget.cat.exts.contains(extOf(e.path))).map((e) => e.path).toList();
+    final its = await withStats((await scan()).where((e) => widget.cat.exts.contains(extOf(e.path))).toList());
+    its.sort((a, b) => b.s.modified.compareTo(a.s.modified));
+    final fs = its.map((i) => i.e.path).toList();
     final m = <String, List<String>>{};
     for (final x in fs) {
       m.putIfAbsent(p.dirname(x), () => []).add(x);
     }
-    final g = m.entries.toList()..sort((a, b) => b.value.length.compareTo(a.value.length));
+    final g = m.entries.toList();
     if (!mounted) return;
     setState(() {
       all = fs;
@@ -1844,12 +1890,12 @@ class _MediaCatState extends State<MediaCatPage> {
       );
     } else {
       body = GridView.builder(
-        padding: const EdgeInsets.fromLTRB(6, 4, 6, 24),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, crossAxisSpacing: 4, mainAxisSpacing: 4),
+        padding: const EdgeInsets.only(bottom: 24),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, crossAxisSpacing: 2, mainAxisSpacing: 2),
         itemCount: all.length,
         itemBuilder: (_, i) => InkWell(
           onTap: () => openFile(context, all[i], siblings: all),
-          child: LayoutBuilder(builder: (_, c) => ClipRRect(borderRadius: BorderRadius.circular(6), child: _thumb(all[i], c.maxWidth))),
+          child: LayoutBuilder(builder: (_, c) => mediaThumb(all[i], c.maxWidth)),
         ),
       );
     }
