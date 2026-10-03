@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player/video_player.dart';
 
 const rootPath = '/storage/emulated/0';
 const blue = Color(0xFF3B82E8);
@@ -212,6 +214,22 @@ Widget fileIcon(Item it, {double size = 42}) {
     );
   }
   return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
+}
+
+Future<void> openExternal(BuildContext context, String path) async {
+  final r = await OpenFilex.open(path);
+  if (r.type != ResultType.done && context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không mở được: ${r.message}')));
+  }
+}
+
+Future<void> openFile(BuildContext context, String path) async {
+  final c = catOf(path)?.name;
+  if (c == 'Video' || c == 'Âm thanh') {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(path: path, video: c == 'Video')));
+  } else {
+    await openExternal(context, path);
+  }
 }
 
 // ---------- app ----------
@@ -658,8 +676,7 @@ class _BrowserState extends State<BrowserPage> {
       }
       return;
     }
-    final r = await OpenFilex.open(it.e.path);
-    if (r.type != ResultType.done) _msg('Không mở được: ${r.message}');
+    await openFile(context, it.e.path);
   }
 
   void _sheet(Item it) {
@@ -684,6 +701,7 @@ class _BrowserState extends State<BrowserPage> {
               o(Icons.delete_forever, 'Xoá hẳn', () => _purge([path]), color: Colors.red),
             ] else ...[
               o(Icons.open_in_new, 'Mở', () => _openItem(it)),
+              if (!it.isDir) o(Icons.apps, 'Mở bằng ứng dụng khác', () => openExternal(context, path)),
               o(Icons.edit, 'Đổi tên', () => _rename(path)),
               o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
               o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
@@ -1004,11 +1022,171 @@ class _StatsState extends State<StatsPage> {
                 leading: SizedBox(width: 42, height: 42, child: fileIcon(it)),
                 title: Text(it.name, maxLines: 1, overflow: TextOverflow.ellipsis),
                 subtitle: Text('${fmtSize(it.s.size)} | ${p.dirname(it.e.path).replaceFirst(rootPath, 'Bộ nhớ trong')}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
-                onTap: () => OpenFilex.open(it.e.path),
+                onTap: () => openFile(context, it.e.path),
               ),
           ]);
         },
       ),
+    );
+  }
+}
+
+// ---------- player ----------
+class PlayerPage extends StatefulWidget {
+  final String path;
+  final bool video;
+  const PlayerPage({super.key, required this.path, required this.video});
+  @override
+  State<PlayerPage> createState() => _PlayerState();
+}
+
+class _PlayerState extends State<PlayerPage> {
+  late final VideoPlayerController c;
+  bool ready = false, show = true, landscape = false;
+  String? err;
+
+  @override
+  void initState() {
+    super.initState();
+    c = VideoPlayerController.file(File(widget.path));
+    c.addListener(_tick);
+    c.initialize().then((_) {
+      if (!mounted) return;
+      setState(() => ready = true);
+      c.play();
+    }).catchError((Object e) {
+      if (mounted) setState(() => err = '$e');
+    });
+  }
+
+  void _tick() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    c.removeListener(_tick);
+    c.dispose();
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    super.dispose();
+  }
+
+  void _rotate() {
+    landscape = !landscape;
+    SystemChrome.setPreferredOrientations(landscape ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight] : [DeviceOrientation.portraitUp]);
+    SystemChrome.setEnabledSystemUIMode(landscape ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge);
+    setState(() {});
+  }
+
+  String _t(Duration d) {
+    final h = d.inHours, m = d.inMinutes % 60, s = d.inSeconds % 60;
+    return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
+  }
+
+  void _seek(Duration d) {
+    final max = c.value.duration;
+    c.seekTo(d < Duration.zero ? Duration.zero : (d > max ? max : d));
+  }
+
+  Future<void> _toggle() async {
+    final v = c.value;
+    if (v.isPlaying) {
+      await c.pause();
+    } else {
+      if (v.duration > Duration.zero && v.position >= v.duration) await c.seekTo(Duration.zero);
+      await c.play();
+    }
+  }
+
+  Widget _controls() {
+    final v = c.value;
+    final dur = v.duration.inMilliseconds.toDouble();
+    final pos = v.position.inMilliseconds.toDouble().clamp(0.0, dur > 0 ? dur : 0.0);
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Row(children: [
+        const SizedBox(width: 12),
+        Text(_t(v.position), style: const TextStyle(color: Colors.white, fontSize: 12)),
+        Expanded(
+          child: Slider(
+            value: pos,
+            max: dur > 0 ? dur : 1,
+            activeColor: Colors.white,
+            inactiveColor: Colors.white30,
+            onChanged: ready ? (x) => c.seekTo(Duration(milliseconds: x.round())) : null,
+          ),
+        ),
+        Text(_t(v.duration), style: const TextStyle(color: Colors.white, fontSize: 12)),
+        const SizedBox(width: 12),
+      ]),
+      Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        IconButton(tooltip: 'Lùi 10 giây', iconSize: 34, color: Colors.white, icon: const Icon(Icons.replay_10), onPressed: ready ? () => _seek(v.position - const Duration(seconds: 10)) : null),
+        const SizedBox(width: 16),
+        IconButton(tooltip: v.isPlaying ? 'Tạm dừng' : 'Phát', iconSize: 56, color: Colors.white, icon: Icon(v.isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled), onPressed: ready ? _toggle : null),
+        const SizedBox(width: 16),
+        IconButton(tooltip: 'Tới 10 giây', iconSize: 34, color: Colors.white, icon: const Icon(Icons.forward_10), onPressed: ready ? () => _seek(v.position + const Duration(seconds: 10)) : null),
+      ]),
+      const SizedBox(height: 8),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = p.basename(widget.path);
+    Widget center;
+    if (err != null) {
+      center = Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.error_outline, color: Colors.white70, size: 48),
+          const SizedBox(height: 12),
+          const Text('Không phát được tập tin này. Định dạng có thể chưa được hỗ trợ.', textAlign: TextAlign.center, style: TextStyle(color: Colors.white)),
+          const SizedBox(height: 12),
+          FilledButton(onPressed: () => openExternal(context, widget.path), child: const Text('Mở bằng ứng dụng khác')),
+        ]),
+      );
+    } else if (!ready) {
+      center = const CircularProgressIndicator(color: Colors.white);
+    } else if (widget.video) {
+      center = AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c));
+    } else {
+      center = Column(mainAxisSize: MainAxisSize.min, children: [
+        const CircleAvatar(radius: 70, backgroundColor: Color(0xFF7A52E8), child: Icon(Icons.music_note, size: 80, color: Colors.white)),
+        const SizedBox(height: 20),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: 24), child: Text(name, textAlign: TextAlign.center, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontSize: 18))),
+      ]);
+    }
+    final bars = !widget.video || show || err != null;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.video ? () => setState(() => show = !show) : null,
+            child: Center(child: center),
+          ),
+        ),
+        if (bars)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              color: Colors.black54,
+              child: SafeArea(
+                bottom: false,
+                child: Row(children: [
+                  IconButton(tooltip: 'Quay lại', color: Colors.white, icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context)),
+                  Expanded(child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontSize: 16))),
+                  if (widget.video) IconButton(tooltip: landscape ? 'Xoay dọc' : 'Xoay ngang', color: Colors.white, icon: const Icon(Icons.screen_rotation), onPressed: _rotate),
+                ]),
+              ),
+            ),
+          ),
+        if (bars && err == null)
+          Positioned(left: 0, right: 0, bottom: 0, child: Container(color: Colors.black54, child: SafeArea(top: false, child: _controls()))),
+      ]),
     );
   }
 }
