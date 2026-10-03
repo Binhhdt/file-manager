@@ -1,12 +1,16 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 
+import 'package:archive/archive_io.dart' as ar;
 import 'package:fc_native_video_thumbnail/fc_native_video_thumbnail.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart' as sp;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
@@ -87,14 +91,55 @@ String uniquePath(String dir, String name) {
   return p.join(dir, '$b ($i)$e');
 }
 
-Future<void> copyEntity(String src, String dest) async {
+class CancelledException implements Exception {}
+
+/// Trang thai cua mot tac vu dai (sao chep, nen...), dung cho hop thoai tien trinh.
+class Job {
+  final progress = ValueNotifier<double>(0);
+  final label = ValueNotifier<String>('');
+  bool cancelled = false;
+  int total = 0, done = 0;
+  void add(int n) {
+    done += n;
+    progress.value = total > 0 ? (done / total).clamp(0.0, 1.0) : 0;
+  }
+}
+
+Future<void> copyEntity(String src, String dest, [Job? job]) async {
+  if (job?.cancelled ?? false) throw CancelledException();
   if (FileSystemEntity.isDirectorySync(src)) {
     await Directory(dest).create(recursive: true);
     await for (final e in Directory(src).list(followLinks: false)) {
-      await copyEntity(e.path, p.join(dest, p.basename(e.path)));
+      await copyEntity(e.path, p.join(dest, p.basename(e.path)), job);
     }
-  } else {
+    return;
+  }
+  if (job == null) {
     await File(src).copy(dest);
+    return;
+  }
+  job.label.value = p.basename(src);
+  final inp = await File(src).open();
+  final out = await File(dest).open(mode: FileMode.write);
+  var ok = false;
+  try {
+    final buf = Uint8List(1 << 20);
+    while (true) {
+      if (job.cancelled) throw CancelledException();
+      final n = await inp.readInto(buf);
+      if (n <= 0) break;
+      await out.writeFrom(buf, 0, n);
+      job.add(n);
+    }
+    ok = true;
+  } finally {
+    await inp.close();
+    await out.close();
+    if (!ok) {
+      try {
+        await File(dest).delete();
+      } catch (_) {}
+    }
   }
 }
 
@@ -106,7 +151,7 @@ Future<void> deleteEntity(String src) async {
   }
 }
 
-Future<void> moveEntity(String src, String dest) async {
+Future<void> moveEntity(String src, String dest, [Job? job]) async {
   try {
     if (FileSystemEntity.isDirectorySync(src)) {
       await Directory(src).rename(dest);
@@ -114,7 +159,7 @@ Future<void> moveEntity(String src, String dest) async {
       await File(src).rename(dest);
     }
   } catch (_) {
-    await copyEntity(src, dest);
+    await copyEntity(src, dest, job);
     await deleteEntity(src);
   }
 }
@@ -132,25 +177,117 @@ Future<int> sizeOf(String path) async {
   }
 }
 
+List<FileSystemEntity>? scanCache;
+
 Future<List<FileSystemEntity>> scan({bool dirs = false}) async {
-  final out = <FileSystemEntity>[];
-  Future<void> walk(Directory d) async {
-    try {
-      await for (final e in d.list(followLinks: false)) {
-        if (p.basename(e.path).startsWith('.')) continue;
-        if (e is Directory) {
-          if (e.path == '$rootPath/Android') continue;
-          if (dirs) out.add(e);
-          await walk(e);
-        } else if (e is File) {
-          out.add(e);
+  if (scanCache == null) {
+    final out = <FileSystemEntity>[];
+    Future<void> walk(Directory d) async {
+      try {
+        await for (final e in d.list(followLinks: false)) {
+          if (p.basename(e.path).startsWith('.')) continue;
+          if (e is Directory) {
+            if (e.path == '$rootPath/Android') continue;
+            out.add(e);
+            await walk(e);
+          } else if (e is File) {
+            out.add(e);
+          }
+        }
+      } catch (_) {}
+    }
+
+    await walk(Directory(rootPath));
+    scanCache = out;
+  }
+  return dirs ? List.of(scanCache!) : scanCache!.whereType<File>().toList();
+}
+
+const textExts = {'txt', 'md', 'json', 'csv', 'log', 'xml', 'html', 'htm', 'js', 'css', 'dart', 'py', 'java', 'kt', 'yaml', 'yml', 'ini', 'cfg', 'lrc', 'srt'};
+
+bool isArchive(String path) {
+  final l = path.toLowerCase();
+  return l.endsWith('.zip') || l.endsWith('.tar') || l.endsWith('.tar.gz') || l.endsWith('.tgz');
+}
+
+String archiveBase(String path) {
+  var n = p.basename(path);
+  for (final e in ['.tar.gz', '.tgz', '.tar', '.zip']) {
+    if (n.toLowerCase().endsWith(e)) {
+      n = n.substring(0, n.length - e.length);
+      break;
+    }
+  }
+  return n.isEmpty ? 'Giải nén' : n;
+}
+
+Future<void> unzipTo(String src, String out) => Isolate.run(() async {
+      await (ar.extractFileToDisk as dynamic)(src, out);
+    });
+
+Future<void> zipPaths(List<String> srcs, String dest) => Isolate.run(() async {
+      final dynamic enc = ar.ZipFileEncoder();
+      enc.create(dest);
+      for (final s in srcs) {
+        if (FileSystemEntity.isDirectorySync(s)) {
+          await enc.addDirectory(Directory(s));
+        } else {
+          await enc.addFile(File(s));
         }
       }
-    } catch (_) {}
-  }
+      await enc.close();
+    });
 
-  await walk(Directory(rootPath));
-  return out;
+Future<void> runJob(BuildContext context, String title, Job job, Future<void> Function() body, {bool cancellable = true}) async {
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: Text(title),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          ValueListenableBuilder<String>(valueListenable: job.label, builder: (_, v, __) => Text(v, maxLines: 1, overflow: TextOverflow.ellipsis)),
+          const SizedBox(height: 12),
+          ValueListenableBuilder<double>(
+            valueListenable: job.progress,
+            builder: (_, v, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              LinearProgressIndicator(value: v > 0 ? v : null),
+              const SizedBox(height: 6),
+              Text(v > 0 ? '${(v * 100).round()}% | ${fmtSize(job.done)}/${fmtSize(job.total)}' : 'Đang xử lý...', style: const TextStyle(fontSize: 12)),
+            ]),
+          ),
+        ]),
+        actions: [if (cancellable) TextButton(onPressed: () => job.cancelled = true, child: const Text('Huỷ'))],
+      ),
+    ),
+  );
+  try {
+    await body();
+  } finally {
+    if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+  }
+}
+
+Future<void> shareFiles(BuildContext context, List<String> paths) async {
+  final files = paths.where((x) => FileSystemEntity.isFileSync(x)).toList();
+  if (files.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Chỉ chia sẻ được tập tin, không chia sẻ được thư mục')));
+    return;
+  }
+  try {
+    await sp.Share.shareXFiles([for (final x in files) sp.XFile(x)]);
+  } catch (e) {
+    if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không chia sẻ được: $e')));
+  }
+}
+
+List<String> extVolumes() {
+  try {
+    return Directory('/storage').listSync().whereType<Directory>().map((d) => d.path).where((x) => !x.endsWith('/emulated') && !x.endsWith('/self')).toList();
+  } catch (_) {
+    return [];
+  }
 }
 
 Future<List<Item>> withStats(List<FileSystemEntity> es) async {
@@ -302,10 +439,30 @@ Future<void> openExternal(BuildContext context, String path) async {
   }
 }
 
-Future<void> openFile(BuildContext context, String path) async {
+Future<void> openFile(BuildContext context, String path, {List<String>? siblings}) async {
   final c = catOf(path)?.name;
+  var list = siblings ?? [path];
+  var idx = list.indexOf(path);
+  if (idx < 0) {
+    list = [path];
+    idx = 0;
+  }
+  Widget? page;
   if (c == 'Video' || c == 'Âm thanh') {
-    await Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(path: path, video: c == 'Video')));
+    page = PlayerPage(paths: list, index: idx, video: c == 'Video');
+  } else if (c == 'Hình') {
+    page = ImageViewerPage(paths: list, index: idx);
+  } else if (textExts.contains(extOf(path))) {
+    var small = false;
+    try {
+      small = await File(path).length() <= 2 * 1024 * 1024;
+    } catch (_) {}
+    if (small) page = TextEditorPage(path: path);
+  }
+  if (!context.mounted) return;
+  if (page != null) {
+    final w = page;
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => w));
   } else {
     await openExternal(context, path);
   }
@@ -482,6 +639,18 @@ class _HomeState extends State<HomePage> {
             _tile(Icons.public, 'WebDAV', blue, soon, small: true),
           ]),
         ])),
+        if (extVolumes().isNotEmpty)
+          _card(Column(children: [
+            _sec('Thẻ nhớ và USB'),
+            for (final v in extVolumes())
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.sd_card, color: blue),
+                title: Text(p.basename(v)),
+                subtitle: Text(v),
+                onTap: () => _open(BrowserPage(mode: Mode.dir, path: v)),
+              ),
+          ])),
         _card(Column(children: [
           _sec('Công cụ'),
           _grid([
@@ -536,6 +705,7 @@ class _BrowserState extends State<BrowserPage> {
   String q = '';
   String sort = prefs.getString('sort') ?? 'name';
   bool grid = prefs.getBool('grid') ?? false;
+  bool hidden = prefs.getBool('hidden') ?? false;
 
   bool get isDir => widget.mode == Mode.dir;
   bool get isTrash => widget.mode == Mode.trash;
@@ -559,7 +729,10 @@ class _BrowserState extends State<BrowserPage> {
     try {
       switch (widget.mode) {
         case Mode.dir:
-          es = (await Directory(cur).list(followLinks: false).toList()).where((e) => !p.basename(e.path).startsWith('.')).toList();
+          es = (await Directory(cur).list(followLinks: false).toList()).where((e) {
+            final n = p.basename(e.path);
+            return n != '.FMTrash' && (hidden || !n.startsWith('.'));
+          }).toList();
         case Mode.cat:
           es = (await scan()).where((e) => widget.cat!.exts.contains(extOf(e.path))).toList();
         case Mode.recent:
@@ -617,6 +790,7 @@ class _BrowserState extends State<BrowserPage> {
     } catch (e) {
       _msg('Lỗi: $e');
     }
+    scanCache = null;
     if (mounted) await _load();
   }
 
@@ -710,18 +884,109 @@ class _BrowserState extends State<BrowserPage> {
         return;
       }
     }
+    final srcs = c.paths.where(existsPath).toList();
+    final conflicts = srcs.where((s) => p.dirname(s) != cur && existsPath(p.join(cur, p.basename(s)))).length;
+    var mode = 'keep';
+    if (conflicts > 0) {
+      final r = await showDialog<String>(
+        context: context,
+        builder: (d) => AlertDialog(
+          title: Text('$conflicts mục trùng tên'),
+          content: const Text('Thư mục này đã có mục cùng tên. Bạn muốn xử lý thế nào?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, 'skip'), child: const Text('Bỏ qua')),
+            TextButton(onPressed: () => Navigator.pop(d, 'keep'), child: const Text('Giữ cả hai')),
+            FilledButton(onPressed: () => Navigator.pop(d, 'overwrite'), child: const Text('Ghi đè')),
+          ],
+        ),
+      );
+      if (r == null || !mounted) return;
+      mode = r;
+    }
     clip.value = null;
-    await _run(() async {
-      for (final s in c.paths) {
-        if (!existsPath(s)) continue;
-        if (c.cut) {
-          if (p.dirname(s) == cur) continue;
-          await moveEntity(s, uniquePath(cur, p.basename(s)));
-        } else {
-          await copyEntity(s, uniquePath(cur, p.basename(s)));
+    final job = Job();
+    String result = '';
+    await runJob(context, c.cut ? 'Đang di chuyển' : 'Đang sao chép', job, () async {
+      try {
+        var total = 0;
+        for (final s in srcs) {
+          total += await sizeOf(s);
         }
+        job.total = total;
+        var n = 0;
+        for (final s in srcs) {
+          final same = p.dirname(s) == cur;
+          if (c.cut && same) continue;
+          var dest = p.join(cur, p.basename(s));
+          if (existsPath(dest)) {
+            if (same || mode == 'keep' || p.isWithin(dest, s)) {
+              dest = uniquePath(cur, p.basename(s));
+            } else if (mode == 'skip') {
+              continue;
+            } else {
+              await deleteEntity(dest);
+            }
+          }
+          if (c.cut) {
+            await moveEntity(s, dest, job);
+          } else {
+            await copyEntity(s, dest, job);
+          }
+          n++;
+        }
+        result = c.cut ? 'Đã di chuyển $n mục' : 'Đã sao chép $n mục';
+      } on CancelledException {
+        result = 'Đã huỷ';
+      } catch (e) {
+        result = 'Lỗi: $e';
       }
-    }, c.cut ? 'Đã di chuyển ${c.paths.length} mục' : 'Đã sao chép ${c.paths.length} mục');
+    });
+    _msg(result);
+    scanCache = null;
+    if (mounted) await _load();
+  }
+
+  Future<void> _extract(String path) async {
+    final out = uniquePath(p.dirname(path), archiveBase(path));
+    final job = Job()..label.value = p.basename(path);
+    String result = '';
+    await runJob(context, 'Đang giải nén', job, () async {
+      try {
+        await unzipTo(path, out);
+        result = 'Đã giải nén vào "${p.basename(out)}"';
+      } catch (e) {
+        result = 'Không giải nén được: $e';
+      }
+    }, cancellable: false);
+    _msg(result);
+    scanCache = null;
+    if (mounted) await _load();
+  }
+
+  Future<void> _zip(List<String> paths) async {
+    if (paths.isEmpty) return;
+    final dir = isDir ? cur : p.dirname(paths.first);
+    final def = paths.length == 1 ? '${p.basenameWithoutExtension(paths.first)}.zip' : 'Tập tin nén.zip';
+    var s = await prompt(context, 'Nén thành zip', def);
+    if (_badName(s) || !mounted) return;
+    if (!s!.toLowerCase().endsWith('.zip')) s = '$s.zip';
+    final dest = uniquePath(dir, s);
+    final job = Job()..label.value = p.basename(dest);
+    String result = '';
+    await runJob(context, 'Đang nén', job, () async {
+      try {
+        await zipPaths(paths, dest);
+        result = 'Đã nén thành "${p.basename(dest)}"';
+      } catch (e) {
+        result = 'Không nén được: $e';
+        try {
+          await File(dest).delete();
+        } catch (_) {}
+      }
+    }, cancellable: false);
+    _msg(result);
+    scanCache = null;
+    if (mounted) await _load();
   }
 
   void _info(Item it) {
@@ -755,7 +1020,15 @@ class _BrowserState extends State<BrowserPage> {
       }
       return;
     }
-    await openFile(context, it.e.path);
+    final path = it.e.path;
+    if (isArchive(path)) {
+      if (await confirm(context, 'Giải nén?', 'Giải nén "${it.name}" vào một thư mục mới cùng chỗ.', 'Giải nén')) await _extract(path);
+      return;
+    }
+    final c = catOf(path);
+    final sib = c == null ? null : items.where((i) => !i.isDir && catOf(i.e.path) == c).map((i) => i.e.path).toList();
+    await openFile(context, path, siblings: sib);
+    if (mounted && textExts.contains(extOf(path))) _load();
   }
 
   void _sheet(Item it) {
@@ -781,6 +1054,9 @@ class _BrowserState extends State<BrowserPage> {
             ] else ...[
               o(Icons.open_in_new, 'Mở', () => _openItem(it)),
               if (!it.isDir) o(Icons.apps, 'Mở bằng ứng dụng khác', () => openExternal(context, path)),
+              if (!it.isDir) o(Icons.share, 'Chia sẻ', () => shareFiles(context, [path])),
+              if (isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
+              o(Icons.archive, 'Nén thành zip', () => _zip([path])),
               o(Icons.edit, 'Đổi tên', () => _rename(path)),
               o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
               o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
@@ -864,8 +1140,8 @@ class _BrowserState extends State<BrowserPage> {
   Widget build(BuildContext context) {
     final selecting = sel.isNotEmpty;
     final atTop = !isDir || cur == widget.path || cur == rootPath;
-    final sp = sel.toList();
-    Item one() => items.firstWhere((i) => i.e.path == sp.first);
+    final picked = sel.toList();
+    Item one() => items.firstWhere((i) => i.e.path == picked.first);
 
     Widget body;
     if (loading) {
@@ -955,17 +1231,31 @@ class _BrowserState extends State<BrowserPage> {
               ? [
                   IconButton(tooltip: 'Chọn tất cả', icon: const Icon(Icons.select_all), onPressed: () => setState(() => sel.addAll(items.map((i) => i.e.path)))),
                   if (isTrash) ...[
-                    IconButton(tooltip: 'Khôi phục', icon: const Icon(Icons.restore), onPressed: () => _restore(sp)),
-                    IconButton(tooltip: 'Xoá hẳn', icon: const Icon(Icons.delete_forever), onPressed: () => _purge(sp)),
+                    IconButton(tooltip: 'Khôi phục', icon: const Icon(Icons.restore), onPressed: () => _restore(picked)),
+                    IconButton(tooltip: 'Xoá hẳn', icon: const Icon(Icons.delete_forever), onPressed: () => _purge(picked)),
                   ] else ...[
-                    IconButton(tooltip: 'Sao chép', icon: const Icon(Icons.copy), onPressed: () => _toClip(sp, false)),
-                    IconButton(tooltip: 'Di chuyển', icon: const Icon(Icons.drive_file_move), onPressed: () => _toClip(sp, true)),
-                    IconButton(tooltip: 'Xoá', icon: const Icon(Icons.delete), onPressed: () => _delete(sp)),
-                    if (sel.length == 1)
-                      PopupMenuButton<String>(
-                        onSelected: (v) => v == 'ren' ? _rename(sp.first) : _info(one()),
-                        itemBuilder: (_) => const [PopupMenuItem(value: 'ren', child: Text('Đổi tên')), PopupMenuItem(value: 'info', child: Text('Chi tiết'))],
-                      ),
+                    IconButton(tooltip: 'Sao chép', icon: const Icon(Icons.copy), onPressed: () => _toClip(picked, false)),
+                    IconButton(tooltip: 'Di chuyển', icon: const Icon(Icons.drive_file_move), onPressed: () => _toClip(picked, true)),
+                    IconButton(tooltip: 'Xoá', icon: const Icon(Icons.delete), onPressed: () => _delete(picked)),
+                    PopupMenuButton<String>(
+                      onSelected: (v) {
+                        if (v == 'ren') {
+                          _rename(picked.first);
+                        } else if (v == 'info') {
+                          _info(one());
+                        } else if (v == 'share') {
+                          shareFiles(context, picked);
+                        } else {
+                          _zip(picked);
+                        }
+                      },
+                      itemBuilder: (_) => [
+                        const PopupMenuItem(value: 'share', child: Text('Chia sẻ')),
+                        const PopupMenuItem(value: 'zip', child: Text('Nén thành zip')),
+                        if (sel.length == 1) const PopupMenuItem(value: 'ren', child: Text('Đổi tên')),
+                        if (sel.length == 1) const PopupMenuItem(value: 'info', child: Text('Chi tiết')),
+                      ],
+                    ),
                   ],
                 ]
               : [
@@ -978,6 +1268,11 @@ class _BrowserState extends State<BrowserPage> {
                       } else if (v == 'empty') {
                         _purge(items.map((i) => i.e.path).toList());
                       } else if (v == 'refresh') {
+                        scanCache = null;
+                        _load();
+                      } else if (v == 'hidden') {
+                        hidden = !hidden;
+                        prefs.setBool('hidden', hidden);
                         _load();
                       } else {
                         sort = v;
@@ -988,6 +1283,7 @@ class _BrowserState extends State<BrowserPage> {
                     itemBuilder: (_) => [
                       PopupMenuItem(value: 'grid', child: Text(grid ? 'Xem dạng danh sách' : 'Xem dạng lưới')),
                       const PopupMenuItem(value: 'refresh', child: Text('Làm mới')),
+                      if (isDir) PopupMenuItem(value: 'hidden', child: Text(hidden ? 'Ẩn tập tin ẩn' : 'Hiện tập tin ẩn')),
                       if (isTrash && items.isNotEmpty) const PopupMenuItem(value: 'empty', child: Text('Dọn sạch thùng rác')),
                       if (widget.mode != Mode.recent && !isTrash) ...[
                         const PopupMenuDivider(),
@@ -1112,9 +1408,11 @@ class _StatsState extends State<StatsPage> {
 
 // ---------- player ----------
 class PlayerPage extends StatefulWidget {
-  final String path;
+  final List<String> paths;
+  final int index;
   final bool video;
-  const PlayerPage({super.key, required this.path, required this.video});
+  const PlayerPage({super.key, required this.paths, required this.index, required this.video});
+  String get path => paths[index];
   @override
   State<PlayerPage> createState() => _PlayerState();
 }
@@ -1138,8 +1436,22 @@ class _PlayerState extends State<PlayerPage> {
     });
   }
 
+  bool _ended = false;
+
   void _tick() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    final v = c.value;
+    if (ready && !_ended && !widget.video && v.duration > Duration.zero && v.position >= v.duration && widget.index < widget.paths.length - 1) {
+      _ended = true;
+      _go(widget.index + 1);
+      return;
+    }
+    setState(() {});
+  }
+
+  void _go(int i) {
+    if (i < 0 || i >= widget.paths.length) return;
+    Navigator.pushReplacement(context, PageRouteBuilder(pageBuilder: (_, __, ___) => PlayerPage(paths: widget.paths, index: i, video: widget.video)));
   }
 
   @override
@@ -1199,11 +1511,13 @@ class _PlayerState extends State<PlayerPage> {
         const SizedBox(width: 12),
       ]),
       Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        IconButton(tooltip: 'Bài trước', iconSize: 30, color: Colors.white, icon: const Icon(Icons.skip_previous), onPressed: widget.index > 0 ? () => _go(widget.index - 1) : null),
         IconButton(tooltip: 'Lùi 10 giây', iconSize: 34, color: Colors.white, icon: const Icon(Icons.replay_10), onPressed: ready ? () => _seek(v.position - const Duration(seconds: 10)) : null),
-        const SizedBox(width: 16),
+        const SizedBox(width: 8),
         IconButton(tooltip: v.isPlaying ? 'Tạm dừng' : 'Phát', iconSize: 56, color: Colors.white, icon: Icon(v.isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled), onPressed: ready ? _toggle : null),
-        const SizedBox(width: 16),
+        const SizedBox(width: 8),
         IconButton(tooltip: 'Tới 10 giây', iconSize: 34, color: Colors.white, icon: const Icon(Icons.forward_10), onPressed: ready ? () => _seek(v.position + const Duration(seconds: 10)) : null),
+        IconButton(tooltip: 'Bài sau', iconSize: 30, color: Colors.white, icon: const Icon(Icons.skip_next), onPressed: widget.index < widget.paths.length - 1 ? () => _go(widget.index + 1) : null),
       ]),
       const SizedBox(height: 8),
     ]);
@@ -1258,6 +1572,7 @@ class _PlayerState extends State<PlayerPage> {
                 child: Row(children: [
                   IconButton(tooltip: 'Quay lại', color: Colors.white, icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context)),
                   Expanded(child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontSize: 16))),
+                  IconButton(tooltip: 'Chia sẻ', color: Colors.white, icon: const Icon(Icons.share), onPressed: () => shareFiles(context, [widget.path])),
                   if (widget.video) IconButton(tooltip: landscape ? 'Xoay dọc' : 'Xoay ngang', color: Colors.white, icon: const Icon(Icons.screen_rotation), onPressed: _rotate),
                 ]),
               ),
@@ -1266,6 +1581,172 @@ class _PlayerState extends State<PlayerPage> {
         if (bars && err == null)
           Positioned(left: 0, right: 0, bottom: 0, child: Container(color: Colors.black54, child: SafeArea(top: false, child: _controls()))),
       ]),
+    );
+  }
+}
+
+// ---------- image viewer ----------
+class ImageViewerPage extends StatefulWidget {
+  final List<String> paths;
+  final int index;
+  const ImageViewerPage({super.key, required this.paths, required this.index});
+  @override
+  State<ImageViewerPage> createState() => _ImageViewerState();
+}
+
+class _ImageViewerState extends State<ImageViewerPage> {
+  late int i = widget.index;
+  late final PageController pc = PageController(initialPage: widget.index);
+  bool bars = true;
+
+  @override
+  void dispose() {
+    pc.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
+      appBar: bars
+          ? AppBar(
+              backgroundColor: Colors.black54,
+              foregroundColor: Colors.white,
+              title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(p.basename(widget.paths[i]), style: const TextStyle(fontSize: 15), maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text('${i + 1}/${widget.paths.length}', style: const TextStyle(fontSize: 12)),
+              ]),
+              actions: [
+                IconButton(tooltip: 'Chia sẻ', icon: const Icon(Icons.share), onPressed: () => shareFiles(context, [widget.paths[i]])),
+                IconButton(tooltip: 'Mở bằng ứng dụng khác', icon: const Icon(Icons.apps), onPressed: () => openExternal(context, widget.paths[i])),
+              ],
+            )
+          : null,
+      body: PageView.builder(
+        controller: pc,
+        itemCount: widget.paths.length,
+        onPageChanged: (n) => setState(() => i = n),
+        itemBuilder: (_, n) => GestureDetector(
+          onTap: () => setState(() => bars = !bars),
+          child: InteractiveViewer(
+            minScale: 1,
+            maxScale: 5,
+            child: Center(
+              child: Image.file(
+                File(widget.paths[n]),
+                fit: BoxFit.contain,
+                errorBuilder: (_, __, ___) => const Padding(padding: EdgeInsets.all(24), child: Text('Không hiển thị được ảnh này.', style: TextStyle(color: Colors.white))),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------- text editor ----------
+class TextEditorPage extends StatefulWidget {
+  final String path;
+  const TextEditorPage({super.key, required this.path});
+  @override
+  State<TextEditorPage> createState() => _TextEditorState();
+}
+
+class _TextEditorState extends State<TextEditorPage> {
+  final t = TextEditingController();
+  bool loading = true, dirty = false;
+  String? err;
+
+  @override
+  void initState() {
+    super.initState();
+    File(widget.path).readAsString().then((v) {
+      if (!mounted) return;
+      t.text = v;
+      setState(() => loading = false);
+    }).catchError((Object e) {
+      if (mounted) {
+        setState(() {
+          loading = false;
+          err = 'Không đọc được tập tin dưới dạng văn bản.';
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    t.dispose();
+    super.dispose();
+  }
+
+  Future<bool> _save() async {
+    try {
+      await File(widget.path).writeAsString(t.text);
+      if (!mounted) return true;
+      setState(() => dirty = false);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Đã lưu')));
+      return true;
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không lưu được: $e')));
+      return false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !dirty,
+      onPopInvokedWithResult: (did, _) async {
+        if (did) return;
+        final r = await showDialog<String>(
+          context: context,
+          builder: (d) => AlertDialog(
+            title: const Text('Lưu thay đổi?'),
+            content: const Text('Tập tin có thay đổi chưa lưu.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(d, 'no'), child: const Text('Không lưu')),
+              TextButton(onPressed: () => Navigator.pop(d), child: const Text('Huỷ')),
+              FilledButton(onPressed: () => Navigator.pop(d, 'yes'), child: const Text('Lưu')),
+            ],
+          ),
+        );
+        if (r == null || !context.mounted) return;
+        if (r == 'yes' && !await _save()) return;
+        if (!context.mounted) return;
+        setState(() => dirty = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (context.mounted) Navigator.pop(context);
+        });
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(p.basename(widget.path), style: const TextStyle(fontSize: 17)),
+          actions: [
+            if (err == null && !loading) IconButton(tooltip: 'Lưu', icon: const Icon(Icons.save), onPressed: dirty ? _save : null),
+            IconButton(tooltip: 'Mở bằng ứng dụng khác', icon: const Icon(Icons.apps), onPressed: () => openExternal(context, widget.path)),
+          ],
+        ),
+        body: loading
+            ? const Center(child: CircularProgressIndicator())
+            : err != null
+                ? Center(child: Text(err!))
+                : TextField(
+                    controller: t,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    keyboardType: TextInputType.multiline,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+                    decoration: const InputDecoration(border: InputBorder.none, contentPadding: EdgeInsets.all(12)),
+                    onChanged: (_) {
+                      if (!dirty) setState(() => dirty = true);
+                    },
+                  ),
+      ),
     );
   }
 }
