@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:fc_native_video_thumbnail/fc_native_video_thumbnail.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
@@ -213,10 +214,62 @@ Widget fileIcon(Item it, {double size = 42}) {
           errorBuilder: (_, __, ___) => Icon(c.icon, size: size, color: c.color)),
     );
   }
+  if (c != null && c.name == 'Video') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size);
   return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
 }
 
+class VideoThumb extends StatefulWidget {
+  final String path;
+  final double size;
+  const VideoThumb({super.key, required this.path, required this.size});
+  @override
+  State<VideoThumb> createState() => _VideoThumbState();
+}
+
+class _VideoThumbState extends State<VideoThumb> {
+  late final Future<String?> future = _make();
+
+  Future<String?> _make() async {
+    try {
+      final dir = Directory('${Directory.systemTemp.path}/thumbs');
+      await dir.create(recursive: true);
+      final dest = '${dir.path}/${widget.path.hashCode}.jpg';
+      if (await File(dest).exists()) return dest;
+      final ok = await FcNativeVideoThumbnail().getVideoThumbnail(srcFile: widget.path, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80);
+      return ok ? dest : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.size;
+    return FutureBuilder<String?>(
+      future: future,
+      builder: (_, snap) {
+        if (snap.data == null) return Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4));
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Stack(alignment: Alignment.center, children: [
+            Image.file(File(snap.data!), width: s, height: s, fit: BoxFit.cover, errorBuilder: (_, __, ___) => Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4))),
+            Container(decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle), child: Icon(Icons.play_arrow, color: Colors.white, size: s * 0.45)),
+          ]),
+        );
+      },
+    );
+  }
+}
+
 Future<void> openExternal(BuildContext context, String path) async {
+  if (extOf(path) == 'apk' && !await Permission.requestInstallPackages.isGranted) {
+    if (!(await Permission.requestInstallPackages.request()).isGranted) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Hãy bật "Cho phép từ nguồn này" rồi bấm lại vào tập tin APK')));
+      }
+      return;
+    }
+  }
   final r = await OpenFilex.open(path);
   if (r.type != ResultType.done && context.mounted) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không mở được: ${r.message}')));
