@@ -1195,30 +1195,37 @@ class _BrowserState extends State<BrowserPage> {
       );
     } else if (grid) {
       body = GridView.builder(
-        padding: const EdgeInsets.fromLTRB(8, 8, 8, 90),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.66),
+        padding: const EdgeInsets.fromLTRB(6, 6, 6, 90),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.8),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
           return InkWell(
+            borderRadius: BorderRadius.circular(10),
             onTap: () => _tap(it),
             onLongPress: () => setState(() => sel.add(it.e.path)),
             child: Container(
               decoration: BoxDecoration(color: on ? blue.withAlpha(50) : null, borderRadius: BorderRadius.circular(10)),
-              padding: const EdgeInsets.all(3),
-              child: Column(mainAxisAlignment: MainAxisAlignment.start, children: [
-                const SizedBox(height: 4),
-                SizedBox(
-                  width: 66,
-                  height: 66,
-                  child: Stack(children: [
-                    fileIcon(it, size: 66),
-                    if (selecting) Positioned(right: 0, bottom: 0, child: tickMark(on)),
-                  ]),
-                ),
-                const SizedBox(height: 6),
-                Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12.5, height: 1.2)),
-              ]),
+              child: LayoutBuilder(builder: (_, c) {
+                // Hinh thu muc co le trong san nen ve to hon o roi cho tran ra.
+                final w = c.maxWidth * 0.94, h = w * 0.78;
+                return Column(children: [
+                  SizedBox(
+                    width: w,
+                    height: h,
+                    child: Stack(clipBehavior: Clip.none, children: [
+                      Positioned.fill(
+                        child: it.isDir ? OverflowBox(maxWidth: w, maxHeight: w, child: fileIcon(it, size: w)) : Center(child: fileIcon(it, size: h * 0.92)),
+                      ),
+                      if (selecting) Positioned(right: 2, bottom: 0, child: tickMark(on)),
+                    ]),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 2),
+                    child: Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 14, height: 1.15)),
+                  ),
+                ]);
+              }),
             ),
           );
         },
