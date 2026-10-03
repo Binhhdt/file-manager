@@ -44,13 +44,13 @@ class Item {
   String get name => p.basename(e.path);
 }
 
-class Clip {
+class FmClip {
   final List<String> paths;
   final bool cut;
-  Clip(this.paths, this.cut);
+  FmClip(this.paths, this.cut);
 }
 
-final clip = ValueNotifier<Clip?>(null);
+final clip = ValueNotifier<FmClip?>(null);
 
 // ---------- helpers ----------
 String extOf(String path) => p.extension(path).toLowerCase().replaceFirst('.', '');
@@ -884,7 +884,7 @@ class _BrowserState extends State<BrowserPage> {
   }
 
   void _toClip(List<String> paths, bool cut) {
-    clip.value = Clip(paths, cut);
+    clip.value = FmClip(paths, cut);
     if (isDir) {
       setState(sel.clear);
       _msg('Mở thư mục đích rồi nhấn Dán');
@@ -1349,7 +1349,7 @@ class _BrowserState extends State<BrowserPage> {
         ),
         body: body,
         floatingActionButton: isDir && !selecting
-            ? ValueListenableBuilder<Clip?>(
+            ? ValueListenableBuilder<FmClip?>(
                 valueListenable: clip,
                 builder: (_, c, __) => c != null
                     ? const SizedBox.shrink()
@@ -1382,7 +1382,7 @@ class _BrowserState extends State<BrowserPage> {
               )
             : null,
         bottomNavigationBar: isDir && !selecting
-            ? ValueListenableBuilder<Clip?>(
+            ? ValueListenableBuilder<FmClip?>(
                 valueListenable: clip,
                 builder: (_, c, __) => c == null
                     ? const SizedBox.shrink()
