@@ -39,7 +39,9 @@ jobs:
           import android.media.MediaMetadataRetriever
           import android.media.ThumbnailUtils
           import android.os.Build
+          import android.content.Context
           import android.os.ParcelFileDescriptor
+          import android.os.storage.StorageManager
           import android.provider.MediaStore
           import android.util.Size
           import io.flutter.embedding.android.FlutterActivity
@@ -122,6 +124,33 @@ jobs:
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
+                  if (method == "volumes") {
+                      val out = ArrayList<Map<String, String>>()
+                      try {
+                          if (Build.VERSION.SDK_INT >= 30) {
+                              val sm = this@MainActivity.getSystemService(Context.STORAGE_SERVICE) as StorageManager
+                              for (v in sm.storageVolumes) {
+                                  if (v.isPrimary) continue
+                                  val d = v.directory ?: continue
+                                  out.add(mapOf("path" to d.absolutePath, "label" to (v.getDescription(this@MainActivity) ?: d.name)))
+                              }
+                          }
+                          if (out.isEmpty()) {
+                              for (f in this@MainActivity.getExternalFilesDirs(null)) {
+                                  if (f == null) continue
+                                  val full = f.absolutePath
+                                  val i = full.indexOf("/Android/")
+                                  if (i <= 0) continue
+                                  val root = full.substring(0, i)
+                                  if (root.startsWith("/storage/emulated")) continue
+                                  out.add(mapOf("path" to root, "label" to File(root).name))
+                              }
+                          }
+                      } catch (e: Throwable) {
+                      }
+                      result.success(out)
+                      return@setMethodCallHandler
+                  }
                       val src = call.argument<String>("src")
                       val dest = call.argument<String>("dest")
                       val known = setOf("apkIcon", "videoThumb", "pdfThumb", "audioArt", "duration")
