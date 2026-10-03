@@ -341,7 +341,7 @@ Future<bool> confirm(BuildContext context, String title, String msg, String ok) 
 }
 
 Widget fileIcon(Item it, {double size = 42}) {
-  if (it.isDir) return Icon(Icons.folder, size: size, color: const Color(0xFFF2B63C));
+  if (it.isDir) return Icon(Icons.folder, size: size, color: blue);
   final c = catOf(it.e.path);
   if (c != null && c.name == 'Hình') {
     return ClipRRect(
@@ -627,7 +627,7 @@ class _HomeState extends State<HomePage> {
             ),
           ),
         ]),
-        _card(_grid([for (final c in cats) _tile(c.icon, c.name, c.color, () => _open(BrowserPage(mode: Mode.cat, cat: c)))])),
+        _card(_grid([for (final c in cats) _tile(c.icon, c.name, c.color, () => _open(c.name == 'Hình' || c.name == 'Video' ? MediaCatPage(cat: c) : BrowserPage(mode: Mode.cat, cat: c)))])),
         _card(Column(children: [
           _sec('Mạng'),
           _grid([
@@ -692,7 +692,8 @@ class BrowserPage extends StatefulWidget {
   final Mode mode;
   final String path;
   final Cat? cat;
-  const BrowserPage({super.key, required this.mode, this.path = rootPath, this.cat});
+  final String? only;
+  const BrowserPage({super.key, required this.mode, this.path = rootPath, this.cat, this.only});
   @override
   State<BrowserPage> createState() => _BrowserState();
 }
@@ -704,7 +705,7 @@ class _BrowserState extends State<BrowserPage> {
   final sel = <String>{};
   String q = '';
   String sort = prefs.getString('sort') ?? 'name';
-  bool grid = prefs.getBool('grid') ?? false;
+  bool grid = prefs.getBool('grid') ?? true;
   bool hidden = prefs.getBool('hidden') ?? false;
 
   bool get isDir => widget.mode == Mode.dir;
@@ -734,7 +735,7 @@ class _BrowserState extends State<BrowserPage> {
             return n != '.FMTrash' && (hidden || !n.startsWith('.'));
           }).toList();
         case Mode.cat:
-          es = (await scan()).where((e) => widget.cat!.exts.contains(extOf(e.path))).toList();
+          es = (await scan()).where((e) => widget.cat!.exts.contains(extOf(e.path)) && (widget.only == null || p.dirname(e.path) == widget.only)).toList();
         case Mode.recent:
           es = await scan();
         case Mode.search:
@@ -1096,7 +1097,7 @@ class _BrowserState extends State<BrowserPage> {
       case Mode.dir:
         return cur == rootPath ? 'Bộ nhớ trong' : p.basename(cur);
       case Mode.cat:
-        return widget.cat!.name;
+        return widget.only != null ? p.basename(widget.only!) : widget.cat!.name;
       case Mode.recent:
         return 'Gần đây';
       case Mode.trash:
@@ -1158,7 +1159,7 @@ class _BrowserState extends State<BrowserPage> {
     } else if (grid) {
       body = GridView.builder(
         padding: const EdgeInsets.fromLTRB(8, 8, 8, 90),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, childAspectRatio: 0.85),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.66),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
@@ -1167,11 +1168,12 @@ class _BrowserState extends State<BrowserPage> {
             onLongPress: () => setState(() => sel.add(it.e.path)),
             child: Container(
               decoration: BoxDecoration(color: on ? blue.withAlpha(50) : null, borderRadius: BorderRadius.circular(10)),
-              padding: const EdgeInsets.all(6),
-              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                on ? const Icon(Icons.check_circle, size: 60, color: blue) : fileIcon(it, size: 60),
+              padding: const EdgeInsets.all(3),
+              child: Column(mainAxisAlignment: MainAxisAlignment.start, children: [
+                const SizedBox(height: 4),
+                on ? const Icon(Icons.check_circle, size: 66, color: blue) : fileIcon(it, size: 66),
                 const SizedBox(height: 6),
-                Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 13)),
+                Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12.5, height: 1.2)),
               ]),
             ),
           );
@@ -1747,6 +1749,135 @@ class _TextEditorState extends State<TextEditorPage> {
                     },
                   ),
       ),
+    );
+  }
+}
+
+// ---------- media category (grouped by folder) ----------
+class MediaCatPage extends StatefulWidget {
+  final Cat cat;
+  const MediaCatPage({super.key, required this.cat});
+  @override
+  State<MediaCatPage> createState() => _MediaCatState();
+}
+
+class _MediaCatState extends State<MediaCatPage> {
+  bool loading = true, folders = true;
+  List<String> all = [];
+  List<MapEntry<String, List<String>>> groups = [];
+
+  bool get isVideo => widget.cat.name == 'Video';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final fs = (await scan()).where((e) => widget.cat.exts.contains(extOf(e.path))).map((e) => e.path).toList();
+    final m = <String, List<String>>{};
+    for (final x in fs) {
+      m.putIfAbsent(p.dirname(x), () => []).add(x);
+    }
+    final g = m.entries.toList()..sort((a, b) => b.value.length.compareTo(a.value.length));
+    if (!mounted) return;
+    setState(() {
+      all = fs;
+      groups = g;
+      loading = false;
+    });
+  }
+
+  Widget _thumb(String path, double s) {
+    if (isVideo) return VideoThumb(key: ValueKey(path), path: path, size: s);
+    return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 360, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(widget.cat.icon, size: s * 0.5, color: widget.cat.color)));
+  }
+
+  Widget _chip(String label, IconData icon, bool on, VoidCallback tap) => Padding(
+        padding: const EdgeInsets.only(right: 8),
+        child: ChoiceChip(avatar: Icon(icon, size: 18), label: Text(label), selected: on, showCheckmark: false, onSelected: (_) => tap()),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    Widget body;
+    if (loading) {
+      body = const Center(child: CircularProgressIndicator());
+    } else if (all.isEmpty) {
+      body = const Center(child: Text('Chưa có tập tin nào thuộc loại này.', style: TextStyle(color: Colors.grey)));
+    } else if (folders) {
+      body = GridView.builder(
+        padding: const EdgeInsets.fromLTRB(10, 4, 10, 24),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 10, mainAxisSpacing: 10),
+        itemCount: groups.length,
+        itemBuilder: (_, i) {
+          final g = groups[i];
+          final name = g.key == rootPath ? 'Bộ nhớ trong' : p.basename(g.key);
+          return InkWell(
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BrowserPage(mode: Mode.cat, cat: widget.cat, only: g.key))).then((_) => _load()),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: LayoutBuilder(
+                builder: (_, c) => Stack(children: [
+                  _thumb(g.value.first, c.maxWidth),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: Container(
+                      color: Colors.black54,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      child: Row(children: [
+                        const Icon(Icons.folder, color: Colors.white, size: 18),
+                        const SizedBox(width: 6),
+                        Expanded(child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontSize: 15))),
+                        Text('(${g.value.length})', style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                      ]),
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+          );
+        },
+      );
+    } else {
+      body = GridView.builder(
+        padding: const EdgeInsets.fromLTRB(6, 4, 6, 24),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, crossAxisSpacing: 4, mainAxisSpacing: 4),
+        itemCount: all.length,
+        itemBuilder: (_, i) => InkWell(
+          onTap: () => openFile(context, all[i], siblings: all),
+          child: LayoutBuilder(builder: (_, c) => ClipRRect(borderRadius: BorderRadius.circular(6), child: _thumb(all[i], c.maxWidth))),
+        ),
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.cat.name),
+        actions: [
+          IconButton(tooltip: 'Tìm kiếm', icon: const Icon(Icons.search), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BrowserPage(mode: Mode.search)))),
+          IconButton(
+              tooltip: 'Làm mới',
+              icon: const Icon(Icons.refresh),
+              onPressed: () {
+                scanCache = null;
+                setState(() => loading = true);
+                _load();
+              }),
+        ],
+      ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+          child: Row(children: [
+            _chip('Thư mục', Icons.folder, folders, () => setState(() => folders = true)),
+            _chip(widget.cat.name, widget.cat.icon, !folders, () => setState(() => folders = false)),
+          ]),
+        ),
+        Expanded(child: body),
+      ]),
     );
   }
 }
