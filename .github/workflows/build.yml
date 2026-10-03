@@ -34,8 +34,12 @@ jobs:
 
           import android.graphics.Bitmap
           import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.pdf.PdfRenderer
+          import android.media.MediaMetadataRetriever
           import android.media.ThumbnailUtils
           import android.os.Build
+          import android.os.ParcelFileDescriptor
           import android.provider.MediaStore
           import android.util.Size
           import io.flutter.embedding.android.FlutterActivity
@@ -45,44 +49,92 @@ jobs:
           import java.io.FileOutputStream
 
           class MainActivity : FlutterActivity() {
+              private fun saveJpeg(bmp: Bitmap, dest: String) {
+                  FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 82, it) }
+              }
+
+              private fun work(method: String, src: String, dest: String): Any {
+                  when (method) {
+                      "apkIcon" -> {
+                          val ai = packageManager.getPackageArchiveInfo(src, 0)?.applicationInfo ?: return false
+                          ai.sourceDir = src
+                          ai.publicSourceDir = src
+                          val d = ai.loadIcon(packageManager)
+                          val bmp = Bitmap.createBitmap(144, 144, Bitmap.Config.ARGB_8888)
+                          d.setBounds(0, 0, 144, 144)
+                          d.draw(Canvas(bmp))
+                          FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                          return true
+                      }
+                      "videoThumb" -> {
+                          @Suppress("DEPRECATION")
+                          val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29)
+                              ThumbnailUtils.createVideoThumbnail(File(src), Size(320, 320), null)
+                          else
+                              ThumbnailUtils.createVideoThumbnail(src, MediaStore.Video.Thumbnails.MINI_KIND)
+                          if (bmp == null) return false
+                          saveJpeg(bmp, dest)
+                          return true
+                      }
+                      "pdfThumb" -> {
+                          val fd = ParcelFileDescriptor.open(File(src), ParcelFileDescriptor.MODE_READ_ONLY)
+                          val r = PdfRenderer(fd)
+                          try {
+                              val page = r.openPage(0)
+                              val w = 320
+                              val h = (w.toFloat() * page.height / page.width).toInt().coerceIn(1, 1200)
+                              val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                              bmp.eraseColor(Color.WHITE)
+                              page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                              page.close()
+                              saveJpeg(bmp, dest)
+                          } finally {
+                              r.close()
+                              fd.close()
+                          }
+                          return true
+                      }
+                      "audioArt" -> {
+                          val mmr = MediaMetadataRetriever()
+                          try {
+                              mmr.setDataSource(src)
+                              val pic = mmr.embeddedPicture ?: return false
+                              File(dest).writeBytes(pic)
+                              return true
+                          } finally {
+                              mmr.release()
+                          }
+                      }
+                      "duration" -> {
+                          val mmr = MediaMetadataRetriever()
+                          try {
+                              mmr.setDataSource(src)
+                              return mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                          } finally {
+                              mmr.release()
+                          }
+                      }
+                  }
+                  return false
+              }
+
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
+                      val method = call.method
                       val src = call.argument<String>("src")
                       val dest = call.argument<String>("dest")
-                      if (src == null || dest == null || (call.method != "apkIcon" && call.method != "videoThumb")) {
+                      val known = setOf("apkIcon", "videoThumb", "pdfThumb", "audioArt", "duration")
+                      if (src == null || dest == null || !known.contains(method)) {
                           result.notImplemented()
                       } else {
-                          val isApk = call.method == "apkIcon"
                           Thread {
-                              var ok = false
-                              try {
-                                  if (isApk) {
-                                      val ai = packageManager.getPackageArchiveInfo(src, 0)?.applicationInfo
-                                      if (ai != null) {
-                                          ai.sourceDir = src
-                                          ai.publicSourceDir = src
-                                          val d = ai.loadIcon(packageManager)
-                                          val bmp = Bitmap.createBitmap(144, 144, Bitmap.Config.ARGB_8888)
-                                          d.setBounds(0, 0, 144, 144)
-                                          d.draw(Canvas(bmp))
-                                          FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                                          ok = true
-                                      }
-                                  } else {
-                                      @Suppress("DEPRECATION")
-                                      val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29)
-                                          ThumbnailUtils.createVideoThumbnail(File(src), Size(256, 256), null)
-                                      else
-                                          ThumbnailUtils.createVideoThumbnail(src, MediaStore.Video.Thumbnails.MINI_KIND)
-                                      if (bmp != null) {
-                                          FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 80, it) }
-                                          ok = true
-                                      }
-                                  }
+                              val res: Any = try {
+                                  work(method, src, dest)
                               } catch (e: Throwable) {
+                                  if (method == "duration") 0L else false
                               }
-                              runOnUiThread { result.success(ok) }
+                              runOnUiThread { result.success(res) }
                           }.start()
                       }
                   }
