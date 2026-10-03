@@ -23,7 +23,7 @@ jobs:
           rm -rf lib test
           cp -r /tmp/keep/lib . && cp /tmp/keep/pubspec.yaml .
           M=android/app/src/main/AndroidManifest.xml
-          sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><application android:requestLegacyExternalStorage="true"#' $M
+          sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           cat $M
       - run: flutter pub get
