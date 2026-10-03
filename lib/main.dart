@@ -99,9 +99,14 @@ class Job {
   final label = ValueNotifier<String>('');
   bool cancelled = false;
   int total = 0, done = 0;
+  void start(int t) {
+    total = t;
+    progress.value = t > 0 ? 1e-6 : 0;
+  }
+
   void add(int n) {
     done += n;
-    progress.value = total > 0 ? (done / total).clamp(0.0, 1.0) : 0;
+    progress.value = total > 0 ? (done / total).clamp(1e-6, 1.0) : 0;
   }
 }
 
@@ -152,16 +157,23 @@ Future<void> deleteEntity(String src) async {
 }
 
 Future<void> moveEntity(String src, String dest, [Job? job]) async {
+  var renamed = false;
   try {
     if (FileSystemEntity.isDirectorySync(src)) {
       await Directory(src).rename(dest);
     } else {
       await File(src).rename(dest);
     }
-  } catch (_) {
-    await copyEntity(src, dest, job);
-    await deleteEntity(src);
+    renamed = true;
+  } catch (_) {}
+  if (renamed) {
+    // Cung o dia: doi cho la xong ngay, cong luon dung luong vao tien trinh.
+    job?.add(await sizeOf(dest));
+    return;
   }
+  // Khac o dia (vi du sang the nho): phai chep roi xoa ban goc.
+  await copyEntity(src, dest, job);
+  await deleteEntity(src);
 }
 
 Future<int> sizeOf(String path) async {
@@ -252,9 +264,9 @@ Future<void> runJob(BuildContext context, String title, Job job, Future<void> Fu
           ValueListenableBuilder<double>(
             valueListenable: job.progress,
             builder: (_, v, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              LinearProgressIndicator(value: v > 0 ? v : null),
+              LinearProgressIndicator(value: v > 0 ? v : null, minHeight: 6),
               const SizedBox(height: 6),
-              Text(v > 0 ? '${(v * 100).round()}% | ${fmtSize(job.done)}/${fmtSize(job.total)}' : 'Đang xử lý...', style: const TextStyle(fontSize: 12)),
+              Text(v > 0 ? '${(v * 100).floor()}%   ${fmtSize(job.done)} / ${fmtSize(job.total)}' : 'Đang chuẩn bị...', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
             ]),
           ),
         ]),
@@ -1067,7 +1079,7 @@ class _BrowserState extends State<BrowserPage> {
         for (final s in srcs) {
           total += await sizeOf(s);
         }
-        job.total = total;
+        job.start(total);
         var n = 0;
         for (final s in srcs) {
           final same = p.dirname(s) == cur;
@@ -1213,8 +1225,8 @@ class _BrowserState extends State<BrowserPage> {
               if (isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
               o(Icons.archive, 'Nén thành zip', () => _zip([path])),
               o(Icons.edit, 'Đổi tên', () => _rename(path)),
-              o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
-              o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
+              if (clip.value == null) o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
+              if (clip.value == null) o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
               if (it.isDir)
                 o(Icons.star, bm.contains(path) ? 'Bỏ dấu trang' : 'Thêm dấu trang', () async {
                   bm.contains(path) ? bm.remove(path) : bm.add(path);
@@ -1424,8 +1436,8 @@ class _BrowserState extends State<BrowserPage> {
                     IconButton(tooltip: 'Khôi phục', icon: const Icon(Icons.restore), onPressed: () => _restore(picked)),
                     IconButton(tooltip: 'Xoá hẳn', icon: const Icon(Icons.delete_forever), onPressed: () => _purge(picked)),
                   ] else ...[
-                    IconButton(tooltip: 'Sao chép', icon: const Icon(Icons.copy), onPressed: () => _toClip(picked, false)),
-                    IconButton(tooltip: 'Di chuyển', icon: const Icon(Icons.drive_file_move), onPressed: () => _toClip(picked, true)),
+                    if (clip.value == null) IconButton(tooltip: 'Sao chép', icon: const Icon(Icons.copy), onPressed: () => _toClip(picked, false)),
+                    if (clip.value == null) IconButton(tooltip: 'Di chuyển', icon: const Icon(Icons.drive_file_move), onPressed: () => _toClip(picked, true)),
                     IconButton(tooltip: 'Xoá', icon: const Icon(Icons.delete), onPressed: () => _delete(picked)),
                     PopupMenuButton<String>(
                       onSelected: (v) {
@@ -1518,7 +1530,7 @@ class _BrowserState extends State<BrowserPage> {
                       ),
               )
             : null,
-        bottomNavigationBar: isDir && !selecting
+        bottomNavigationBar: isDir
             ? ValueListenableBuilder<FmClip?>(
                 valueListenable: clip,
                 builder: (_, c, __) => c == null
@@ -1529,7 +1541,12 @@ class _BrowserState extends State<BrowserPage> {
                           child: Row(children: [
                             Expanded(child: FilledButton.icon(onPressed: _paste, icon: const Icon(Icons.paste), label: Text('Dán ${c.paths.length} mục vào đây'))),
                             const SizedBox(width: 8),
-                            OutlinedButton(onPressed: () => clip.value = null, child: const Text('Huỷ')),
+                            OutlinedButton(
+                                onPressed: () {
+                                  clip.value = null;
+                                  setState(() {});
+                                },
+                                child: const Text('Huỷ')),
                           ]),
                         ),
                       ),
