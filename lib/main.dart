@@ -283,6 +283,16 @@ Future<void> shareFiles(BuildContext context, List<String> paths) async {
 }
 
 /// Danh sach the nho va USB dang gan: moi phan tu la [duong dan, ten hien thi].
+Future<List<int>> dfOf(String path) async {
+  try {
+    final r = await Process.run('df', ['-k', path]);
+    final f = r.stdout.toString().trim().split('\n').last.trim().split(RegExp(r'\s+'));
+    return [int.parse(f[1]) * 1024, int.parse(f[2]) * 1024];
+  } catch (_) {
+    return [0, 0];
+  }
+}
+
 Future<List<List<String>>> loadVolumes() async {
   final out = <List<String>>[];
   try {
@@ -640,6 +650,7 @@ class _HomeState extends State<HomePage> {
   bool? granted;
   int total = 0, used = 0;
   List<List<String>> vols = [];
+  Map<String, List<int>> volUse = {};
 
   @override
   void initState() {
@@ -650,24 +661,83 @@ class _HomeState extends State<HomePage> {
   Future<void> _init() async {
     final g = await ensurePerm();
     if (g) await _df();
-    vols = await loadVolumes();
+    await _loadVols();
     if (mounted) setState(() => granted = g);
   }
 
   Future<void> _df() async {
-    try {
-      final r = await Process.run('df', ['-k', rootPath]);
-      final lines = r.stdout.toString().trim().split('\n');
-      final f = lines.last.trim().split(RegExp(r'\s+'));
-      total = int.parse(f[1]) * 1024;
-      used = int.parse(f[2]) * 1024;
-    } catch (_) {}
+    final r = await dfOf(rootPath);
+    total = r[0];
+    used = r[1];
   }
+
+  Future<void> _loadVols() async {
+    final v = await loadVolumes();
+    final u = <String, List<int>>{};
+    for (final x in v) {
+      u[x[0]] = await dfOf(x[0]);
+    }
+    vols = v;
+    volUse = u;
+  }
+
+  Widget _storage(String title, int total, int used, VoidCallback onTap) {
+    final pct = total > 0 ? used / total : 0.0;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(children: [
+            Stack(alignment: Alignment.center, children: [
+              CircularProgressIndicator(value: pct, backgroundColor: Colors.grey.withAlpha(60)),
+              Text('${(pct * 100).round()}%', style: const TextStyle(fontSize: 11)),
+            ]),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600)),
+                Text(total > 0 ? '${fmtSize(used)}/${fmtSize(total)}' : 'Bấm để mở', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _volCard(List<String> v) {
+    final u = volUse[v[0]] ?? const [0, 0];
+    return _storage(v[1], u[0], u[1], () => _open(BrowserPage(mode: Mode.dir, path: v[0])));
+  }
+
+  Widget _analyzer() => Card(
+        margin: const EdgeInsets.only(bottom: 10),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => _open(const StatsPage()),
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Row(children: [
+              Icon(Icons.pie_chart, color: blue, size: 36),
+              SizedBox(width: 10),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Trình phân tích', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontWeight: FontWeight.w600)),
+                  Text('Xem thứ gì chiếm chỗ', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12)),
+                ]),
+              ),
+            ]),
+          ),
+        ),
+      );
 
   void _open(Widget w) {
     Navigator.push(context, MaterialPageRoute(builder: (_) => w)).then((_) async {
       await _df();
-      vols = await loadVolumes();
+      await _loadVols();
       if (mounted) setState(() {});
     });
   }
@@ -715,56 +785,13 @@ class _HomeState extends State<HomePage> {
       final bm = getBm().where(existsPath).toList();
       void soon() => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Tính năng mạng chưa được hỗ trợ')));
       body = ListView(padding: const EdgeInsets.all(10), children: [
-        Row(children: [
-          Expanded(
-            child: Card(
-              margin: const EdgeInsets.only(bottom: 10),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: () => _open(const BrowserPage(mode: Mode.dir)),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Row(children: [
-                    Stack(alignment: Alignment.center, children: [
-                      CircularProgressIndicator(value: pct, backgroundColor: Colors.grey.withAlpha(60)),
-                      Text('${(pct * 100).round()}%', style: const TextStyle(fontSize: 11)),
-                    ]),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        const Text('Lưu trữ nội bộ', style: TextStyle(fontWeight: FontWeight.w600)),
-                        Text(total > 0 ? '${fmtSize(used)}/${fmtSize(total)}' : 'Mở bộ nhớ', style: const TextStyle(fontSize: 12)),
-                      ]),
-                    ),
-                  ]),
-                ),
-              ),
-            ),
-          ),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: _storage('Lưu trữ nội bộ', total, used, () => _open(const BrowserPage(mode: Mode.dir)))),
           const SizedBox(width: 8),
-          Expanded(
-            child: Card(
-              margin: const EdgeInsets.only(bottom: 10),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: () => _open(const StatsPage()),
-                child: const Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Row(children: [
-                    Icon(Icons.pie_chart, color: blue, size: 36),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text('Trình phân tích', style: TextStyle(fontWeight: FontWeight.w600)),
-                        Text('Xem thứ gì chiếm chỗ', style: TextStyle(fontSize: 12)),
-                      ]),
-                    ),
-                  ]),
-                ),
-              ),
-            ),
-          ),
+          Expanded(child: vols.isNotEmpty ? _volCard(vols[0]) : _analyzer()),
         ]),
+        for (var i = 1; i < vols.length; i++) _volCard(vols[i]),
+        if (vols.isNotEmpty) _analyzer(),
         _card(_grid([for (final c in cats) _tile(c.icon, c.name, c.color, () => _open(c.name == 'Hình' || c.name == 'Video' ? MediaCatPage(cat: c) : BrowserPage(mode: Mode.cat, cat: c)))])),
         _card(Column(children: [
           _sec('Mạng'),
@@ -776,18 +803,6 @@ class _HomeState extends State<HomePage> {
             _tile(Icons.bluetooth, 'Bluetooth', blue, soon, small: true),
             _tile(Icons.public, 'WebDAV', blue, soon, small: true),
           ]),
-        ])),
-        _card(Column(children: [
-          _sec('Thẻ nhớ và USB'),
-          if (vols.isEmpty) const Align(alignment: Alignment.centerLeft, child: Text('Không tìm thấy thẻ nhớ hoặc USB đang gắn vào máy.', style: TextStyle(fontSize: 13))),
-          for (final v in vols)
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.sd_card, color: blue),
-              title: Text(v[1]),
-              subtitle: Text(v[0]),
-              onTap: () => _open(BrowserPage(mode: Mode.dir, path: v[0])),
-            ),
         ])),
         _card(Column(children: [
           _sec('Công cụ'),
