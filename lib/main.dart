@@ -303,6 +303,15 @@ Future<List<Item>> withStats(List<FileSystemEntity> es) async {
 Map<String, String> getTrash() => Map<String, String>.from(jsonDecode(prefs.getString('trash') ?? '{}') as Map);
 List<String> getBm() => prefs.getStringList('bm') ?? [];
 
+/// Vi tri dang xem do cua tung video (mili giay).
+Map<String, int> getResume() {
+  try {
+    return (jsonDecode(prefs.getString('resume') ?? '{}') as Map).map((k, v) => MapEntry(k as String, (v as num).toInt()));
+  } catch (_) {
+    return {};
+  }
+}
+
 Future<bool> ensurePerm() async {
   if (await Permission.manageExternalStorage.isGranted) return true;
   if (await Permission.storage.isGranted) return true;
@@ -352,7 +361,9 @@ Widget fileIcon(Item it, {double size = 42}) {
     );
   }
   if (c != null && c.name == 'Video') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size);
-  if (c != null && c.name == 'APP') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, apk: true);
+  if (c != null && c.name == 'APP') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'apk');
+  if (c != null && c.name == 'Âm thanh') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'audio');
+  if (extOf(it.e.path) == 'pdf') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'pdf');
   return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
 }
 
@@ -373,45 +384,79 @@ Widget mediaThumb(String path, double s) {
   return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.image, size: s * 0.5, color: c?.color ?? Colors.grey)));
 }
 
-/// Anh thu nho cho video hoac icon cua tap tin APK, tao bang ma Android goc.
+final durCache = <String, int>{};
+
+String fmtDur(int ms) {
+  final d = Duration(milliseconds: ms);
+  final h = d.inHours, m = d.inMinutes % 60, x = d.inSeconds % 60;
+  return h > 0 ? '$h:${two(m)}:${two(x)}' : '${two(m)}:${two(x)}';
+}
+
+/// Anh thu nho tao bang ma Android goc: khung hinh video, bia nhac, trang dau PDF, icon APK.
 class VideoThumb extends StatefulWidget {
   final String path;
   final double size;
-  final bool apk;
+  final String kind; // video | audio | pdf | apk
   final bool square;
-  const VideoThumb({super.key, required this.path, required this.size, this.apk = false, this.square = false});
+  const VideoThumb({super.key, required this.path, required this.size, this.kind = 'video', this.square = false});
   @override
   State<VideoThumb> createState() => _VideoThumbState();
 }
 
 class _VideoThumbState extends State<VideoThumb> {
   late final Future<String?> future = _make();
+  int dur = 0;
+
+  bool get timed => widget.kind == 'video' || widget.kind == 'audio';
+
+  Future<void> _loadDur() async {
+    var d = durCache[widget.path];
+    if (d == null) {
+      try {
+        d = await nativeCh.invokeMethod<int>('duration', {'src': widget.path, 'dest': ''}) ?? 0;
+      } catch (_) {
+        d = 0;
+      }
+    }
+    final int v = d ?? 0;
+    durCache[widget.path] = v;
+    if (mounted && v > 0) setState(() => dur = v);
+  }
 
   Future<String?> _make() async {
+    final src = widget.path;
+    final kind = widget.kind;
+    if (timed) _loadDur();
     try {
       final dir = Directory('${Directory.systemTemp.path}/thumbs');
       await dir.create(recursive: true);
-      final src = widget.path;
       final st = await File(src).stat();
-      final dest = '${dir.path}/${src.hashCode}_${st.size}.${widget.apk ? 'png' : 'jpg'}';
+      final dest = '${dir.path}/${kind}_${src.hashCode}_${st.size}.${kind == 'apk' ? 'png' : 'jpg'}';
       if (await File(dest).exists()) return dest;
+      final none = File('$dest.none');
+      if (await none.exists()) return null;
+      final method = const {'apk': 'apkIcon', 'video': 'videoThumb', 'pdf': 'pdfThumb', 'audio': 'audioArt'}[kind] ?? 'videoThumb';
       try {
-        final ok = await nativeCh.invokeMethod<bool>(widget.apk ? 'apkIcon' : 'videoThumb', {'src': src, 'dest': dest});
+        final ok = await nativeCh.invokeMethod<bool>(method, {'src': src, 'dest': dest});
         if (ok == true) return dest;
       } catch (_) {}
-      if (widget.apk) return null;
-      final dynamic pl = FcNativeVideoThumbnail();
-      final tries = <dynamic Function()>[
-        () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, quality: 80),
-        () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
-        () => pl.getVideoThumbnail(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
-      ];
-      for (final t in tries) {
-        try {
-          final r = await t();
-          if (r == true || await File(dest).exists()) return dest;
-        } catch (_) {}
+      if (kind == 'video') {
+        final dynamic pl = FcNativeVideoThumbnail();
+        final tries = <dynamic Function()>[
+          () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, quality: 80),
+          () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
+          () => pl.getVideoThumbnail(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
+        ];
+        for (final t in tries) {
+          try {
+            final r = await t();
+            if (r == true || await File(dest).exists()) return dest;
+          } catch (_) {}
+        }
       }
+      try {
+        await none.create();
+      } catch (_) {}
       return null;
     } catch (_) {
       return null;
@@ -421,19 +466,61 @@ class _VideoThumbState extends State<VideoThumb> {
   @override
   Widget build(BuildContext context) {
     final s = widget.size;
-    final fallback = widget.apk ? Icon(Icons.android, size: s, color: const Color(0xFF4CAE6C)) : Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4));
+    final k = widget.kind;
+    Widget fallback() {
+      if (k == 'apk') return Icon(Icons.android, size: s, color: const Color(0xFF4CAE6C));
+      if (k == 'pdf') return Icon(Icons.picture_as_pdf, size: s, color: const Color(0xFFE5532D));
+      if (k == 'audio') return Container(width: s, height: s, color: const Color(0xFFD9D9D9), child: Icon(Icons.album, size: s * 0.75, color: const Color(0xFFBDBDBD)));
+      return Container(width: s, height: s, color: const Color(0xFF3FBFB4), child: Icon(Icons.movie, size: s * 0.55, color: Colors.white));
+    }
+
     return FutureBuilder<String?>(
       future: future,
       builder: (_, snap) {
-        if (snap.data == null) return fallback;
-        final img = Image.file(File(snap.data!), width: s, height: s, fit: widget.apk ? BoxFit.contain : BoxFit.cover, errorBuilder: (_, __, ___) => fallback);
-        if (widget.apk) return img;
+        final has = snap.data != null;
+        final Widget base = has ? Image.file(File(snap.data!), width: s, height: s, fit: (k == 'apk' || k == 'pdf') ? BoxFit.contain : BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => fallback()) : fallback();
+        if (k == 'apk') return base;
+        if (k == 'pdf') {
+          return SizedBox(
+            width: s,
+            height: s,
+            child: Stack(children: [
+              Positioned.fill(child: base),
+              if (has && s >= 56)
+                Positioned(
+                  right: s * 0.1,
+                  bottom: 0,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(color: const Color(0xFFF07B2E), borderRadius: BorderRadius.circular(3)),
+                    child: Text('PDF', style: TextStyle(color: Colors.white, fontSize: s * 0.15, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+            ]),
+          );
+        }
+        const sh = [Shadow(blurRadius: 4, color: Colors.black)];
         return ClipRRect(
-          borderRadius: BorderRadius.circular(widget.square ? 0 : 8),
-          child: Stack(alignment: Alignment.center, children: [
-            img,
-            Container(decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle), child: Icon(Icons.play_arrow, color: Colors.white, size: s * (widget.square ? 0.3 : 0.45))),
-          ]),
+          borderRadius: BorderRadius.circular(widget.square ? 0 : 6),
+          child: SizedBox(
+            width: s,
+            height: s,
+            child: Stack(children: [
+              Positioned.fill(child: base),
+              if (s >= 56)
+                Positioned(
+                  left: 3,
+                  right: 2,
+                  bottom: 2,
+                  child: Row(children: [
+                    Icon(k == 'video' ? Icons.play_arrow : Icons.music_note, color: Colors.white, size: s * 0.22, shadows: sh),
+                    if (dur > 0) Flexible(child: Text(fmtDur(dur), maxLines: 1, overflow: TextOverflow.clip, softWrap: false, style: TextStyle(color: Colors.white, fontSize: (s * 0.17).clamp(10.0, 15.0), shadows: sh))),
+                  ]),
+                )
+              else if (k == 'video' && has)
+                Center(child: Icon(Icons.play_arrow, color: Colors.white, size: s * 0.6, shadows: sh)),
+            ]),
+          ),
         );
       },
     );
@@ -1480,9 +1567,27 @@ class _PlayerState extends State<PlayerPage> {
     super.initState();
     c = VideoPlayerController.file(File(widget.path));
     c.addListener(_tick);
-    c.initialize().then((_) {
+    c.initialize().then((_) async {
       if (!mounted) return;
       setState(() => ready = true);
+      final saved = widget.video ? (getResume()[widget.path] ?? 0) : 0;
+      final total = c.value.duration.inMilliseconds;
+      if (saved > 5000 && saved < total - 5000) {
+        final go = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (d) => AlertDialog(
+            title: const Text('Xem tiếp?'),
+            content: Text('Lần trước bạn dừng ở ${fmtDur(saved)}. Bạn muốn xem tiếp đoạn còn lại hay xem lại từ đầu?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Xem từ đầu')),
+              FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Xem tiếp')),
+            ],
+          ),
+        );
+        if (!mounted) return;
+        if (go == true) await c.seekTo(Duration(milliseconds: saved));
+      }
       c.play();
     }).catchError((Object e) {
       if (mounted) setState(() => err = '$e');
@@ -1490,10 +1595,27 @@ class _PlayerState extends State<PlayerPage> {
   }
 
   bool _ended = false;
+  DateTime _lastSave = DateTime.now();
+
+  void _savePos() {
+    if (!widget.video || !ready) return;
+    final m = getResume();
+    final pos = c.value.position.inMilliseconds, total = c.value.duration.inMilliseconds;
+    m.remove(widget.path);
+    if (pos > 5000 && pos < total - 5000) m[widget.path] = pos;
+    while (m.length > 100) {
+      m.remove(m.keys.first);
+    }
+    prefs.setString('resume', jsonEncode(m));
+  }
 
   void _tick() {
     if (!mounted) return;
     final v = c.value;
+    if (v.isPlaying && DateTime.now().difference(_lastSave).inSeconds >= 5) {
+      _lastSave = DateTime.now();
+      _savePos();
+    }
     if (ready && !_ended && !widget.video && v.duration > Duration.zero && v.position >= v.duration && widget.index < widget.paths.length - 1) {
       _ended = true;
       _go(widget.index + 1);
@@ -1510,6 +1632,7 @@ class _PlayerState extends State<PlayerPage> {
   @override
   void dispose() {
     c.removeListener(_tick);
+    _savePos();
     c.dispose();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
