@@ -235,8 +235,21 @@ class _VideoThumbState extends State<VideoThumb> {
       await dir.create(recursive: true);
       final dest = '${dir.path}/${widget.path.hashCode}.jpg';
       if (await File(dest).exists()) return dest;
-      final ok = await FcNativeVideoThumbnail().getVideoThumbnail(srcFile: widget.path, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80);
-      return ok ? dest : null;
+      final src = widget.path;
+      final dynamic pl = FcNativeVideoThumbnail();
+      // Ten ham khac nhau giua cac phien ban thu vien, thu lan luot.
+      final tries = <dynamic Function()>[
+        () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, quality: 80),
+        () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
+        () => pl.getVideoThumbnail(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
+      ];
+      for (final t in tries) {
+        try {
+          final r = await t();
+          if (r == true || await File(dest).exists()) return dest;
+        } catch (_) {}
+      }
+      return null;
     } catch (_) {
       return null;
     }
