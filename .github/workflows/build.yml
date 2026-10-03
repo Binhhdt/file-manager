@@ -26,8 +26,23 @@ jobs:
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           cat $M
-      - run: flutter pub get
-      - run: flutter build apk --release
+      - name: Build APK
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee build.log
+          flutter build apk --release 2>&1 | tee -a build.log
+      - name: Tom tat loi
+        if: failure()
+        run: |
+          touch build.log
+          {
+            echo '### Loi build'
+            echo '```'
+            grep -n -i -E "error|FAILURE|What went wrong|Exception|version solving" -A 6 build.log | head -n 120 || true
+            echo '----- 60 dong cuoi -----'
+            tail -n 60 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: app-release
