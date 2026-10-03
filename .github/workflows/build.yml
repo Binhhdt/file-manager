@@ -26,6 +26,92 @@ jobs:
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           cat $M
+      - name: Ma Android goc va icon ung dung
+        run: |
+          K=$(find android/app/src/main -name MainActivity.kt)
+          cat > "$K" <<'EOF'
+          package com.fmdemo.file_manager
+
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.media.ThumbnailUtils
+          import android.os.Build
+          import android.provider.MediaStore
+          import android.util.Size
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class MainActivity : FlutterActivity() {
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
+                      val src = call.argument<String>("src")
+                      val dest = call.argument<String>("dest")
+                      if (src == null || dest == null || (call.method != "apkIcon" && call.method != "videoThumb")) {
+                          result.notImplemented()
+                      } else {
+                          val isApk = call.method == "apkIcon"
+                          Thread {
+                              var ok = false
+                              try {
+                                  if (isApk) {
+                                      val ai = packageManager.getPackageArchiveInfo(src, 0)?.applicationInfo
+                                      if (ai != null) {
+                                          ai.sourceDir = src
+                                          ai.publicSourceDir = src
+                                          val d = ai.loadIcon(packageManager)
+                                          val bmp = Bitmap.createBitmap(144, 144, Bitmap.Config.ARGB_8888)
+                                          d.setBounds(0, 0, 144, 144)
+                                          d.draw(Canvas(bmp))
+                                          FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                          ok = true
+                                      }
+                                  } else {
+                                      @Suppress("DEPRECATION")
+                                      val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29)
+                                          ThumbnailUtils.createVideoThumbnail(File(src), Size(256, 256), null)
+                                      else
+                                          ThumbnailUtils.createVideoThumbnail(src, MediaStore.Video.Thumbnails.MINI_KIND)
+                                      if (bmp != null) {
+                                          FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 80, it) }
+                                          ok = true
+                                      }
+                                  }
+                              } catch (e: Throwable) {
+                              }
+                              runOnUiThread { result.success(ok) }
+                          }.start()
+                      }
+                  }
+              }
+          }
+          EOF
+          R=android/app/src/main/res
+          mkdir -p $R/mipmap-anydpi-v26 $R/drawable
+          cat > $R/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_fm_bg"/>
+              <foreground android:drawable="@drawable/ic_fm_fg"/>
+          </adaptive-icon>
+          EOF
+          cat > $R/drawable/ic_fm_bg.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#2F6FE0" android:pathData="M0,0h108v108h-108z"/>
+          </vector>
+          EOF
+          cat > $R/drawable/ic_fm_fg.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#F2A300" android:pathData="M30,36h17l6,6h25a4,4 0,0 1,4 4v26a4,4 0,0 1,-4 4H30a4,4 0,0 1,-4 -4V40a4,4 0,0 1,4 -4z"/>
+              <path android:fillColor="#FFD24A" android:pathData="M30,48h48a4,4 0,0 1,4 4v20a4,4 0,0 1,-4 4H30a4,4 0,0 1,-4 -4V52a4,4 0,0 1,4 -4z"/>
+              <group android:translateX="15.5" android:translateY="18">
+                  <path android:fillColor="#2F6FE0" android:pathData="M28,34h5v20h-5v-13.5l-4,2.5v-5z"/>
+                  <path android:fillColor="#2F6FE0" android:fillType="evenOdd" android:pathData="M45,34h5v12h3v4.5h-3v3.5h-5v-3.5h-10v-4z M45,40.5v5.5h-4.6z"/>
+              </group>
+          </vector>
+          EOF
       - name: Build APK
         run: |
           set -o pipefail
