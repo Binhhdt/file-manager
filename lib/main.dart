@@ -215,13 +215,18 @@ Widget fileIcon(Item it, {double size = 42}) {
     );
   }
   if (c != null && c.name == 'Video') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size);
+  if (c != null && c.name == 'APP') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, apk: true);
   return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
 }
 
+const nativeCh = MethodChannel('fm/native');
+
+/// Anh thu nho cho video hoac icon cua tap tin APK, tao bang ma Android goc.
 class VideoThumb extends StatefulWidget {
   final String path;
   final double size;
-  const VideoThumb({super.key, required this.path, required this.size});
+  final bool apk;
+  const VideoThumb({super.key, required this.path, required this.size, this.apk = false});
   @override
   State<VideoThumb> createState() => _VideoThumbState();
 }
@@ -233,11 +238,16 @@ class _VideoThumbState extends State<VideoThumb> {
     try {
       final dir = Directory('${Directory.systemTemp.path}/thumbs');
       await dir.create(recursive: true);
-      final dest = '${dir.path}/${widget.path.hashCode}.jpg';
-      if (await File(dest).exists()) return dest;
       final src = widget.path;
+      final st = await File(src).stat();
+      final dest = '${dir.path}/${src.hashCode}_${st.size}.${widget.apk ? 'png' : 'jpg'}';
+      if (await File(dest).exists()) return dest;
+      try {
+        final ok = await nativeCh.invokeMethod<bool>(widget.apk ? 'apkIcon' : 'videoThumb', {'src': src, 'dest': dest});
+        if (ok == true) return dest;
+      } catch (_) {}
+      if (widget.apk) return null;
       final dynamic pl = FcNativeVideoThumbnail();
-      // Ten ham khac nhau giua cac phien ban thu vien, thu lan luot.
       final tries = <dynamic Function()>[
         () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, quality: 80),
         () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
@@ -258,14 +268,17 @@ class _VideoThumbState extends State<VideoThumb> {
   @override
   Widget build(BuildContext context) {
     final s = widget.size;
+    final fallback = widget.apk ? Icon(Icons.android, size: s, color: const Color(0xFF4CAE6C)) : Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4));
     return FutureBuilder<String?>(
       future: future,
       builder: (_, snap) {
-        if (snap.data == null) return Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4));
+        if (snap.data == null) return fallback;
+        final img = Image.file(File(snap.data!), width: s, height: s, fit: widget.apk ? BoxFit.contain : BoxFit.cover, errorBuilder: (_, __, ___) => fallback);
+        if (widget.apk) return img;
         return ClipRRect(
           borderRadius: BorderRadius.circular(8),
           child: Stack(alignment: Alignment.center, children: [
-            Image.file(File(snap.data!), width: s, height: s, fit: BoxFit.cover, errorBuilder: (_, __, ___) => Icon(Icons.videocam, size: s, color: const Color(0xFF3FBFB4))),
+            img,
             Container(decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle), child: Icon(Icons.play_arrow, color: Colors.white, size: s * 0.45)),
           ]),
         );
