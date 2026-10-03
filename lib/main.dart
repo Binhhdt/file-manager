@@ -282,6 +282,38 @@ Future<void> shareFiles(BuildContext context, List<String> paths) async {
   }
 }
 
+/// Danh sach the nho va USB dang gan: moi phan tu la [duong dan, ten hien thi].
+Future<List<List<String>>> loadVolumes() async {
+  final out = <List<String>>[];
+  try {
+    final r = await nativeCh.invokeMethod<List<dynamic>>('volumes');
+    for (final m in r ?? const []) {
+      final mm = m as Map;
+      out.add(['${mm['path']}', '${mm['label']}']);
+    }
+  } catch (_) {}
+  void add(String path) {
+    if (path.startsWith('/storage/emulated') || path == '/storage/self') return;
+    if (out.any((o) => o[0] == path)) return;
+    if (!Directory(path).existsSync()) return;
+    out.add([path, 'Thẻ nhớ ${p.basename(path)}']);
+  }
+
+  for (final v in extVolumes()) {
+    add(v);
+  }
+  // Du phong: doc bang gan ket cua he thong de tim the nho.
+  try {
+    for (final line in File('/proc/mounts').readAsLinesSync()) {
+      final f = line.split(' ');
+      if (f.length < 2) continue;
+      final m = RegExp(r'^/(?:storage|mnt/media_rw)/([^/]+)$').firstMatch(f[1]);
+      if (m != null) add('/storage/${m.group(1)}');
+    }
+  } catch (_) {}
+  return out;
+}
+
 List<String> extVolumes() {
   try {
     return Directory('/storage').listSync().whereType<Directory>().map((d) => d.path).where((x) => !x.endsWith('/emulated') && !x.endsWith('/self')).toList();
@@ -607,6 +639,7 @@ class HomePage extends StatefulWidget {
 class _HomeState extends State<HomePage> {
   bool? granted;
   int total = 0, used = 0;
+  List<List<String>> vols = [];
 
   @override
   void initState() {
@@ -617,6 +650,7 @@ class _HomeState extends State<HomePage> {
   Future<void> _init() async {
     final g = await ensurePerm();
     if (g) await _df();
+    vols = await loadVolumes();
     if (mounted) setState(() => granted = g);
   }
 
@@ -633,6 +667,7 @@ class _HomeState extends State<HomePage> {
   void _open(Widget w) {
     Navigator.push(context, MaterialPageRoute(builder: (_) => w)).then((_) async {
       await _df();
+      vols = await loadVolumes();
       if (mounted) setState(() {});
     });
   }
@@ -742,18 +777,18 @@ class _HomeState extends State<HomePage> {
             _tile(Icons.public, 'WebDAV', blue, soon, small: true),
           ]),
         ])),
-        if (extVolumes().isNotEmpty)
-          _card(Column(children: [
-            _sec('Thẻ nhớ và USB'),
-            for (final v in extVolumes())
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.sd_card, color: blue),
-                title: Text(p.basename(v)),
-                subtitle: Text(v),
-                onTap: () => _open(BrowserPage(mode: Mode.dir, path: v)),
-              ),
-          ])),
+        _card(Column(children: [
+          _sec('Thẻ nhớ và USB'),
+          if (vols.isEmpty) const Align(alignment: Alignment.centerLeft, child: Text('Không tìm thấy thẻ nhớ hoặc USB đang gắn vào máy.', style: TextStyle(fontSize: 13))),
+          for (final v in vols)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.sd_card, color: blue),
+              title: Text(v[1]),
+              subtitle: Text(v[0]),
+              onTap: () => _open(BrowserPage(mode: Mode.dir, path: v[0])),
+            ),
+        ])),
         _card(Column(children: [
           _sec('Công cụ'),
           _grid([
