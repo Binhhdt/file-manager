@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -190,8 +191,18 @@ Future<int> sizeOf(String path) async {
 }
 
 List<FileSystemEntity>? scanCache;
+DateTime scanAt = DateTime(2000);
+
+String sigOf(List<FileSystemEntity> l) {
+  var h = 0;
+  for (final e in l) {
+    h ^= e.path.hashCode;
+  }
+  return '${l.length}:$h';
+}
 
 Future<List<FileSystemEntity>> scan({bool dirs = false}) async {
+  if (scanCache != null && DateTime.now().difference(scanAt).inSeconds > 30) scanCache = null;
   if (scanCache == null) {
     final out = <FileSystemEntity>[];
     Future<void> walk(Directory d) async {
@@ -211,6 +222,7 @@ Future<List<FileSystemEntity>> scan({bool dirs = false}) async {
 
     await walk(Directory(rootPath));
     scanCache = out;
+    scanAt = DateTime.now();
   }
   return dirs ? List.of(scanCache!) : scanCache!.whereType<File>().toList();
 }
@@ -422,6 +434,9 @@ Widget fileIcon(Item it, {double size = 42}) {
 }
 
 const nativeCh = MethodChannel('fm/native');
+
+/// Nut ve thang trang chu tu bat ky man hinh nao.
+Widget homeBtn(BuildContext context) => IconButton(tooltip: 'Trang chủ', icon: const Icon(Icons.home), onPressed: () => Navigator.popUntil(context, (r) => r.isFirst));
 
 /// Dau chon nho o goc o hinh.
 Widget tickMark(bool on) => Container(
@@ -863,7 +878,11 @@ class BrowserPage extends StatefulWidget {
   State<BrowserPage> createState() => _BrowserState();
 }
 
-class _BrowserState extends State<BrowserPage> {
+class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
+  Timer? _poll;
+  String _lastSig = '';
+  bool _checking = false;
+
   late String cur = widget.path;
   List<Item> items = [];
   bool loading = true;
@@ -880,7 +899,37 @@ class _BrowserState extends State<BrowserPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
+    // Tu kiem tra thu muc dang mo moi 3 giay de hien tap tin moi.
+    if (isDir) _poll = Timer.periodic(const Duration(seconds: 3), (_) => _check());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted && !loading) {
+      scanCache = null;
+      _load(silent: true);
+    }
+  }
+
+  Future<void> _check() async {
+    if (!mounted || loading || _checking) return;
+    if (!(ModalRoute.of(context)?.isCurrent ?? true)) return;
+    _checking = true;
+    try {
+      final at = cur;
+      final raw = await Directory(at).list(followLinks: false).toList();
+      if (mounted && !loading && at == cur && sigOf(raw) != _lastSig) await _load(silent: true);
+    } catch (_) {}
+    _checking = false;
   }
 
   void _msg(String m) {
@@ -890,13 +939,15 @@ class _BrowserState extends State<BrowserPage> {
       ..showSnackBar(SnackBar(content: Text(m)));
   }
 
-  Future<void> _load() async {
-    setState(() => loading = true);
+  Future<void> _load({bool silent = false}) async {
+    if (!silent) setState(() => loading = true);
     var es = <FileSystemEntity>[];
     try {
       switch (widget.mode) {
         case Mode.dir:
-          es = (await Directory(cur).list(followLinks: false).toList()).where((e) {
+          final raw = await Directory(cur).list(followLinks: false).toList();
+          _lastSig = sigOf(raw);
+          es = raw.where((e) {
             final n = p.basename(e.path);
             return n != '.FMTrash' && (hidden || !n.startsWith('.'));
           }).toList();
@@ -924,7 +975,12 @@ class _BrowserState extends State<BrowserPage> {
     setState(() {
       items = out;
       loading = false;
-      sel.clear();
+      if (silent) {
+        final have = out.map((i) => i.e.path).toSet();
+        sel.removeWhere((x) => !have.contains(x));
+      } else {
+        sel.clear();
+      }
     });
   }
 
@@ -1461,6 +1517,7 @@ class _BrowserState extends State<BrowserPage> {
                   ],
                 ]
               : [
+                  homeBtn(context),
                   if (widget.mode != Mode.search) IconButton(tooltip: 'Tìm kiếm', icon: const Icon(Icons.search), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BrowserPage(mode: Mode.search)))),
                   PopupMenuButton<String>(
                     onSelected: (v) async {
@@ -1570,7 +1627,7 @@ class _StatsState extends State<StatsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Trình phân tích')),
+      appBar: AppBar(title: const Text('Trình phân tích'), actions: [homeBtn(context)]),
       body: FutureBuilder<List<Item>>(
         future: future,
         builder: (_, s) {
@@ -2002,7 +2059,21 @@ class MediaCatPage extends StatefulWidget {
   State<MediaCatPage> createState() => _MediaCatState();
 }
 
-class _MediaCatState extends State<MediaCatPage> {
+class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      scanCache = null;
+      _load();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
   bool loading = true, folders = true;
   List<String> all = [];
   List<MapEntry<String, List<String>>> groups = [];
@@ -2012,6 +2083,7 @@ class _MediaCatState extends State<MediaCatPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
   }
 
@@ -2100,6 +2172,7 @@ class _MediaCatState extends State<MediaCatPage> {
       appBar: AppBar(
         title: Text(widget.cat.name),
         actions: [
+          homeBtn(context),
           IconButton(tooltip: 'Tìm kiếm', icon: const Icon(Icons.search), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BrowserPage(mode: Mode.search)))),
           IconButton(
               tooltip: 'Làm mới',
