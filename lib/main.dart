@@ -16,6 +16,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 const rootPath = '/storage/emulated/0';
+
+// Phien ban ung dung. So ban dung do GitHub tu dien moi lan build.
+const appVersion = '1.1.0';
+const appBuild = String.fromEnvironment('BUILD', defaultValue: '?');
 const blue = Color(0xFF3B82E8);
 final trashDir = Directory('$rootPath/.FMTrash');
 late SharedPreferences prefs;
@@ -851,6 +855,10 @@ class _HomeState extends State<HomePage> {
               onTap: () => _open(BrowserPage(mode: Mode.dir, path: b)),
             ),
         ])),
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 10),
+          child: Center(child: Text('Phiên bản $appVersion (bản dựng $appBuild)', style: TextStyle(fontSize: 12, color: Colors.grey))),
+        ),
       ]);
     }
     return Scaffold(
@@ -1014,7 +1022,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       _msg('Lỗi: $e');
     }
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   bool _badName(String? s) {
@@ -1166,7 +1177,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     });
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   Future<void> _extract(String path) async {
@@ -1183,7 +1197,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }, cancellable: false);
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   Future<void> _zip(List<String> paths) async {
@@ -1209,7 +1226,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }, cancellable: false);
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   void _info(Item it) {
@@ -1251,7 +1271,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     final c = catOf(path);
     final sib = c == null ? null : items.where((i) => !i.isDir && catOf(i.e.path) == c).map((i) => i.e.path).toList();
     await openFile(context, path, siblings: sib);
-    if (mounted && textExts.contains(extOf(path))) _load();
+    if (mounted && textExts.contains(extOf(path))) _load(silent: true);
   }
 
   void _sheet(Item it) {
