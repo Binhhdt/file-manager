@@ -1014,7 +1014,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       _msg('Lỗi: $e');
     }
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   bool _badName(String? s) {
@@ -1166,7 +1169,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     });
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   Future<void> _extract(String path) async {
@@ -1183,7 +1189,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }, cancellable: false);
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   Future<void> _zip(List<String> paths) async {
@@ -1209,7 +1218,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }, cancellable: false);
     _msg(result);
     scanCache = null;
-    if (mounted) await _load();
+    if (mounted) {
+      sel.clear();
+      await _load(silent: true);
+    }
   }
 
   void _info(Item it) {
@@ -1251,7 +1263,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     final c = catOf(path);
     final sib = c == null ? null : items.where((i) => !i.isDir && catOf(i.e.path) == c).map((i) => i.e.path).toList();
     await openFile(context, path, siblings: sib);
-    if (mounted && textExts.contains(extOf(path))) _load();
+    if (mounted && textExts.contains(extOf(path))) _load(silent: true);
   }
 
   void _sheet(Item it) {
