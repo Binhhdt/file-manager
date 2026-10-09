@@ -9,6 +9,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Chon main.dart moi nhat
+        run: |
+          # Neu main.dart bi tai nham len thu muc goc va moi hon ban trong lib thi dung ban do.
+          mkdir -p lib
+          USED=lib/main.dart
+          if [ -f main.dart ]; then
+            A=$(git log -1 --format=%ct -- main.dart)
+            B=$(git log -1 --format=%ct -- lib/main.dart)
+            if [ ! -f lib/main.dart ] || [ "${A:-0}" -gt "${B:-0}" ]; then
+              cp main.dart lib/main.dart
+              USED="main.dart o thu muc goc (moi hon ban trong lib)"
+            fi
+          fi
+          V=$(grep -oP "const appVersion = '\K[^']+" lib/main.dart || true)
+          echo "APP_VERSION=${V:-1.0.0}" >> "$GITHUB_ENV"
+          {
+            echo "### Phien ban ${V:-1.0.0} (ban dung ${{ github.run_number }})"
+            echo "Dung tap tin: $USED"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -197,7 +218,7 @@ jobs:
         run: |
           set -o pipefail
           flutter pub get 2>&1 | tee build.log
-          flutter build apk --release 2>&1 | tee -a build.log
+          flutter build apk --release --build-name="$APP_VERSION" --build-number=${{ github.run_number }} --dart-define=BUILD=${{ github.run_number }} 2>&1 | tee -a build.log
       - name: Tom tat loi
         if: failure()
         run: |
