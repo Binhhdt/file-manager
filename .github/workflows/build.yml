@@ -65,6 +65,7 @@ jobs:
           import android.os.storage.StorageManager
           import android.provider.MediaStore
           import android.util.Size
+          import android.view.WindowManager
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
@@ -145,6 +146,12 @@ jobs:
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
+                  if (method == "keepOn") {
+                      if (call.argument<String>("src") == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      result.success(true)
+                      return@setMethodCallHandler
+                  }
                   if (method == "volumes") {
                       val out = ArrayList<Map<String, String>>()
                       try {
@@ -231,6 +238,24 @@ jobs:
             tail -n 60 build.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Ky APK bang khoa rieng
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          if [ -z "$KS_B64" ]; then
+            echo "### Chua co khoa ky rieng: APK van ky bang khoa debug" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "$KS_B64" | base64 -d > /tmp/release.jks
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" sign --ks /tmp/release.jks --ks-key-alias "$KS_ALIAS" --ks-pass env:KS_PASS --key-pass env:KS_PASS --out /tmp/signed.apk "$APK"
+          "$BT/apksigner" verify --print-certs /tmp/signed.apk | head -3
+          mv /tmp/signed.apk "$APK"
+          rm -f /tmp/release.jks
+          echo "### APK da ky bang khoa rieng ($KS_ALIAS)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: app-release

@@ -18,7 +18,7 @@ import 'package:video_player/video_player.dart';
 const rootPath = '/storage/emulated/0';
 
 // Phien ban ung dung. So ban dung do GitHub tu dien moi lan build.
-const appVersion = '1.1.0';
+const appVersion = '1.2.0';
 const appBuild = String.fromEnvironment('BUILD', defaultValue: '?');
 const blue = Color(0xFF3B82E8);
 final trashDir = Directory('$rootPath/.FMTrash');
@@ -58,6 +58,20 @@ class FmClip {
 final clip = ValueNotifier<FmClip?>(null);
 
 // ---------- helpers ----------
+const _vnA = 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ';
+const _vnB = 'aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyyd';
+
+/// Chu thuong, bo dau tieng Viet de tim "mua" ra "Mưa".
+String noAccent(String s) {
+  final l = s.toLowerCase();
+  final b = StringBuffer();
+  for (final ch in l.split('')) {
+    final i = _vnA.indexOf(ch);
+    b.write(i >= 0 ? _vnB[i] : ch);
+  }
+  return b.toString();
+}
+
 String extOf(String path) => p.extension(path).toLowerCase().replaceFirst('.', '');
 
 Cat? catOf(String path) {
@@ -896,6 +910,8 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   bool loading = true;
   final sel = <String>{};
   String q = '';
+  Timer? _deb;
+  int _gen = 0;
   bool get _media => widget.mode == Mode.cat && (widget.cat?.name == 'Hình' || widget.cat?.name == 'Video');
   late String sort = _media ? 'date' : (prefs.getString('sort') ?? 'name');
   bool grid = prefs.getBool('grid') ?? true;
@@ -916,6 +932,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _poll?.cancel();
+    _deb?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -949,6 +966,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
 
   Future<void> _load({bool silent = false}) async {
     if (!silent) setState(() => loading = true);
+    final gen = ++_gen;
     var es = <FileSystemEntity>[];
     try {
       switch (widget.mode) {
@@ -964,8 +982,8 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
         case Mode.recent:
           es = await scan();
         case Mode.search:
-          final s = q.trim().toLowerCase();
-          es = s.isEmpty ? [] : (await scan(dirs: true)).where((e) => p.basename(e.path).toLowerCase().contains(s)).toList();
+          final s = noAccent(q.trim());
+          es = s.isEmpty ? [] : (await scan(dirs: true)).where((e) => noAccent(p.basename(e.path)).contains(s)).toList();
         case Mode.trash:
           if (await trashDir.exists()) es = await trashDir.list(followLinks: false).toList();
       }
@@ -980,6 +998,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       _sort(out);
     }
     if (!mounted) return;
+    if (widget.mode == Mode.search && gen != _gen) return;
     setState(() {
       items = out;
       loading = false;
@@ -1421,7 +1440,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     } else if (grid) {
       body = GridView.builder(
         padding: const EdgeInsets.fromLTRB(6, 6, 6, 90),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.8),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.7),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
@@ -1449,6 +1468,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                     padding: const EdgeInsets.symmetric(horizontal: 2),
                     child: Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 14, height: 1.15)),
                   ),
+                  if (!it.isDir) Text(fmtSize(it.s.size), maxLines: 1, style: const TextStyle(fontSize: 11, color: Colors.grey)),
                 ]);
               }),
             ),
@@ -1498,8 +1518,14 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       cursorColor: Colors.white,
                       textInputAction: TextInputAction.search,
                       decoration: const InputDecoration(hintText: 'Tìm tập tin, thư mục', hintStyle: TextStyle(color: Colors.white70), border: InputBorder.none),
+                      onChanged: (s) {
+                        q = s;
+                        _deb?.cancel();
+                        _deb = Timer(const Duration(milliseconds: 500), _load);
+                      },
                       onSubmitted: (s) {
                         q = s;
+                        _deb?.cancel();
                         _load();
                       },
                     )
@@ -1703,6 +1729,14 @@ class PlayerPage extends StatefulWidget {
 
 class _PlayerState extends State<PlayerPage> {
   late final VideoPlayerController c;
+  bool _awake = false;
+
+  /// Giu man hinh sang trong luc dang phat, tat khi tam dung hoac thoat.
+  void _keepOn(bool on) {
+    if (on == _awake) return;
+    _awake = on;
+    nativeCh.invokeMethod('keepOn', {'src': on ? '1' : '0', 'dest': ''}).catchError((_) => null);
+  }
   bool ready = false, show = true, landscape = false;
   String? err;
 
@@ -1756,6 +1790,7 @@ class _PlayerState extends State<PlayerPage> {
   void _tick() {
     if (!mounted) return;
     final v = c.value;
+    _keepOn(v.isPlaying);
     if (v.isPlaying && DateTime.now().difference(_lastSave).inSeconds >= 5) {
       _lastSave = DateTime.now();
       _savePos();
@@ -1777,6 +1812,7 @@ class _PlayerState extends State<PlayerPage> {
   void dispose() {
     c.removeListener(_tick);
     _savePos();
+    _keepOn(false);
     c.dispose();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
