@@ -33,7 +33,8 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          # Android Lint in the generated Gradle project uses Java 21 APIs.
+          java-version: '21'
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
