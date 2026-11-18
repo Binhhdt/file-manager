@@ -345,7 +345,13 @@ jobs:
           printf 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\n' | sudo tee /etc/udev/rules.d/99-kvm-emulator.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Prepare test fixture encoder
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            python3 -m venv "$RUNNER_TEMP/media-fixtures"
+            "$RUNNER_TEMP/media-fixtures/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: imageio-ffmpeg==0.6.0
+            echo "$RUNNER_TEMP/media-fixtures/bin" >> "$GITHUB_PATH"
+          fi
       - uses: reactivecircus/android-emulator-runner@v2
         env:
           FM_SMOKE_APK: smoke-apk/app-release.apk

@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -111,12 +112,16 @@ def exercise_incoming_call(track):
 
 
 def fixtures(folder):
+    encoder = shutil.which("ffmpeg")
+    if encoder is None:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        encoder = get_ffmpeg_exe()
     for title, length in (("00-fm-short", 5), ("01-fm-second", 100), ("02-fm-third", 100)):
-        run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+        run(encoder, "-v", "error", "-y", "-f", "lavfi", "-i",
             "sine=frequency=480:sample_rate=22050", "-t", str(length), "-c:a",
             "libmp3lame", "-b:a", "48k", "-metadata", f"title={title}",
             "-metadata", "artist=FM Smoke", str(folder / (title + ".mp3")))
-    run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+    run(encoder, "-v", "error", "-y", "-f", "lavfi", "-i",
         "testsrc2=size=160x90:rate=10", "-f", "lavfi", "-i",
         "sine=frequency=520:sample_rate=22050", "-t", "100", "-c:v", "libx264",
         "-threads", "2", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "48k",
