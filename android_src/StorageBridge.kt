@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.database.Cursor
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -18,11 +20,13 @@ import android.provider.DocumentsContract.Document
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
+import android.util.Size
 import android.webkit.MimeTypeMap
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -346,7 +350,7 @@ internal class StorageBridge(private val activity: Activity, messenger: BinaryMe
 
     private data class Node(val id: String, val name: String, val mime: String, val size: Long, val modified: Long) {
         val directory: Boolean get() = mime == Document.MIME_TYPE_DIR
-        fun data() = mapOf("name" to name, "dir" to directory, "size" to size, "modified" to modified)
+        fun data() = mapOf("id" to id, "name" to name, "dir" to directory, "size" to size, "modified" to modified)
     }
 
     private fun node(cursor: Cursor) = Node(
@@ -427,6 +431,31 @@ internal class StorageBridge(private val activity: Activity, messenger: BinaryMe
         val item = resolve(info) ?: return
         if (!DocumentsContract.deleteDocument(resolver, documentUri(info.uri, item.id))) {
             throw IllegalStateException("Android không xoá được ${item.name}")
+        }
+    }
+
+    // Called by the bounded thumbnail queue, independently of file transfers.
+    fun preview(method: String, path: String, destination: String): Any {
+        val info = tree(path)
+        val item = resolve(info) ?: throw FileNotFoundException(path)
+        val uri = documentUri(info.uri, item.id)
+        if (method == "documentDuration") {
+            val reader = MediaMetadataRetriever()
+            try {
+                reader.setDataSource(activity, uri)
+                return reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            } finally {
+                reader.release()
+            }
+        }
+        if (Build.VERSION.SDK_INT < 29) return false
+        val bitmap = resolver.loadThumbnail(uri, Size(384, 384), null)
+        try {
+            return FileOutputStream(destination).use {
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+            }
+        } finally {
+            bitmap.recycle()
         }
     }
 

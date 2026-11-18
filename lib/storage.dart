@@ -36,13 +36,18 @@ class StorageEntry {
   final int size;
   final DateTime modified;
 
-  StorageEntry(this.path, this.type, this.size, this.modified);
+  final int version;
+  final String? identity;
+
+  StorageEntry(this.path, this.type, this.size, this.modified,
+      {this.version = 0, this.identity});
 
   bool get isDir => type == FileSystemEntityType.directory;
   bool get isFile => type == FileSystemEntityType.file;
 
   factory StorageEntry.local(String path, FileStat stat) =>
-      StorageEntry(path, stat.type, stat.size, stat.modified);
+      StorageEntry(path, stat.type, stat.size, stat.modified,
+          version: stat.changed.microsecondsSinceEpoch);
 
   factory StorageEntry.document(String path, Map<dynamic, dynamic> data) =>
       StorageEntry(
@@ -52,6 +57,7 @@ class StorageEntry {
             : FileSystemEntityType.file,
         data['size'] as int,
         DateTime.fromMillisecondsSinceEpoch(data['modified'] as int),
+        identity: data['id'] as String?,
       );
 }
 
