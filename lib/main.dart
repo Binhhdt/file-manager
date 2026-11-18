@@ -16,6 +16,7 @@ import 'package:video_player/video_player.dart';
 
 import 'file_catalog.dart';
 import 'file_operations.dart';
+import 'media_player.dart';
 import 'storage.dart';
 import 'trash.dart';
 import 'thumbnail_cache.dart';
@@ -44,8 +45,8 @@ class Cat {
 
 const cats = <Cat>[
   Cat('Hình', Icons.image, Color(0xFFF09A45), {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic'}),
-  Cat('Video', Icons.videocam, Color(0xFF3FBFB4), {'mp4', 'mkv', 'mov', 'webm', 'avi', '3gp'}),
-  Cat('Âm thanh', Icons.music_note, Color(0xFF7A52E8), {'mp3', 'flac', 'wav', 'm4a', 'ogg', 'aac'}),
+  Cat('Video', Icons.videocam, Color(0xFF3FBFB4), {'mp4', 'mkv', 'mov', 'webm', 'avi', '3gp', 'm4v', 'mpg', 'mpeg'}),
+  Cat('Âm thanh', Icons.music_note, Color(0xFF7A52E8), {'mp3', 'flac', 'wav', 'm4a', 'ogg', 'aac', 'opus', 'amr'}),
   Cat('APP', Icons.android, Color(0xFF4CAE6C), {'apk'}),
   Cat('Sách', Icons.menu_book, Color(0xFFE0A520), {'pdf', 'txt', 'doc', 'docx', 'epub', 'xls', 'xlsx', 'ppt', 'pptx'}),
   Cat('Đã nén', Icons.folder_zip, Color(0xFF4B8FE8), {'zip', 'rar', '7z', 'tar', 'gz'}),
@@ -595,6 +596,16 @@ Future<void> openExternal(BuildContext context, String path) async {
 
 Future<void> openFile(BuildContext context, String path, {List<String>? siblings}) async {
   final c = catOf(path)?.name;
+  if (Platform.isAndroid && (c == 'Video' || c == 'Âm thanh')) {
+    final queue = (siblings ?? [path]).where((item) => catOf(item)?.name == c).toSet().toList();
+    if (!queue.contains(path)) queue.insert(0, path);
+    if (context.mounted) {
+      await Navigator.push(context, MaterialPageRoute(
+        builder: (_) => PlayerPage(paths: queue, index: queue.indexOf(path), video: c == 'Video'),
+      ));
+    }
+    return;
+  }
   if (isSaf(path)) {
     if (c != 'Video' && c != 'Âm thanh' && c != 'Hình') {
       await openExternal(context, path);
@@ -671,6 +682,10 @@ Future<void> main() async {
     }
   });
   unawaited(_cleanOpenedDocuments());
+  if (Platform.isAndroid) mediaPlayback.connect(() {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openActivePlayer());
+    WidgetsBinding.instance.ensureVisualUpdate();
+  });
   runApp(const App());
 }
 
@@ -685,6 +700,18 @@ Future<void> _cleanOpenedDocuments() async {
   } on FileSystemException {
     // Cache cleanup is independent of the file manager's storage operations.
   }
+}
+
+final _appNavigator = GlobalKey<NavigatorState>();
+bool _openingPlayer = false;
+
+void _openActivePlayer() {
+  final navigator = _appNavigator.currentState;
+  if (navigator == null || _openingPlayer || mediaPlayback.fullPlayerVisible || !mediaPlayback.state.hasMedia) return;
+  _openingPlayer = true;
+  navigator.push<void>(MaterialPageRoute(builder: (_) => AndroidMediaPage(
+    playback: mediaPlayback, openExternal: openExternal, share: shareFiles,
+  ))).whenComplete(() => _openingPlayer = false);
 }
 
 class App extends StatelessWidget {
@@ -702,6 +729,22 @@ class App extends StatelessWidget {
       theme: th(Brightness.light),
       darkTheme: th(Brightness.dark),
       home: const HomePage(),
+      navigatorKey: _appNavigator,
+      builder: Platform.isAndroid ? (context, child) => ListenableBuilder(
+        listenable: mediaPlayback,
+        child: child,
+        builder: (context, navigator) {
+          final showMini = mediaPlayback.state.hasMedia && !mediaPlayback.fullPlayerVisible;
+          final mediaQuery = MediaQuery.of(context);
+          return Column(children: [
+            Expanded(child: MediaQuery(
+              data: showMini ? mediaQuery.removePadding(removeBottom: true) : mediaQuery,
+              child: navigator!,
+            )),
+            if (showMini) MediaMiniPlayer(playback: mediaPlayback, openPlayer: _openActivePlayer),
+          ]);
+        },
+      ) : null,
     );
   }
 }
@@ -1908,17 +1951,33 @@ class _StatsState extends State<StatsPage> {
 }
 
 // ---------- player ----------
-class PlayerPage extends StatefulWidget {
+class PlayerPage extends StatelessWidget {
   final List<String> paths;
   final int index;
   final bool video;
   const PlayerPage({super.key, required this.paths, required this.index, required this.video});
-  String get path => paths[index];
+
   @override
-  State<PlayerPage> createState() => _PlayerState();
+  Widget build(BuildContext context) => Platform.isAndroid
+      ? AndroidMediaPage(
+          playback: mediaPlayback, paths: paths, index: index, video: video,
+          oldPositions: video ? getResume() : const {}, openExternal: openExternal, share: shareFiles,
+        )
+      : _InlinePlayerPage(paths: paths, index: index, video: video);
 }
 
-class _PlayerState extends State<PlayerPage> {
+class _InlinePlayerPage extends StatefulWidget {
+  final List<String> paths;
+  final int index;
+  final bool video;
+  const _InlinePlayerPage({required this.paths, required this.index, required this.video});
+  String get path => paths[index];
+
+  @override
+  State<_InlinePlayerPage> createState() => _PlayerState();
+}
+
+class _PlayerState extends State<_InlinePlayerPage> {
   late final VideoPlayerController c;
   bool _awake = false;
 
