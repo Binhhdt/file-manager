@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      android_media_smoke:
+        description: Kiem thu media tren Android Emulator sau khi build
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -47,11 +52,12 @@ jobs:
           M=android/app/src/main/AndroidManifest.xml
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
+          python3 android_src/configure_media.py
           cat $M
       - name: Ma Android goc va icon ung dung
         run: |
           K=$(find android/app/src/main -name MainActivity.kt)
-          cp android_src/StorageBridge.kt "$(dirname "$K")/"
+          cp android_src/StorageBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt "$(dirname "$K")/"
           cat > "$K" <<'EOF'
           package com.fmdemo.file_manager
 
@@ -64,6 +70,8 @@ jobs:
           import android.media.ThumbnailUtils
           import android.os.Build
           import android.content.Intent
+          import android.content.res.Configuration
+          import androidx.media3.common.util.UnstableApi
           import android.os.ParcelFileDescriptor
           import android.provider.MediaStore
           import android.util.Size
@@ -74,10 +82,36 @@ jobs:
           import java.io.File
           import java.io.FileOutputStream
 
+          @UnstableApi
           class MainActivity : FlutterActivity() {
               private var storage: StorageBridge? = null
+              private var media: MediaBridge? = null
+
+              override fun onStart() {
+                  super.onStart()
+                  media?.activityVisible(true)
+              }
+
+              override fun onStop() {
+                  media?.activityVisible(false)
+                  super.onStop()
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  media?.newIntent(intent)
+              }
+
+              override fun onPictureInPictureModeChanged(inPip: Boolean, config: Configuration) {
+                  super.onPictureInPictureModeChanged(inPip, config)
+                  media?.pipChanged(inPip)
+              }
+
 
               override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+                  media?.close()
+                  media = null
                   storage?.close()
                   storage = null
                   super.cleanUpFlutterEngine(flutterEngine)
@@ -184,6 +218,7 @@ jobs:
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   storage = StorageBridge(this, flutterEngine.dartExecutor.binaryMessenger)
+                  media = MediaBridge(this, flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
                   if (method == "keepOn") {
@@ -278,3 +313,36 @@ jobs:
         with:
           name: app-release
           path: build/app/outputs/flutter-apk/app-release.apk
+
+
+  media-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.android_media_smoke }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [24, 36]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release
+          path: smoke-apk
+      - name: Enable KVM for the Android emulator
+        run: |
+          printf 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\n' | sudo tee /etc/udev/rules.d/99-kvm-emulator.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - uses: reactivecircus/android-emulator-runner@v2
+        env:
+          FM_SMOKE_APK: smoke-apk/app-release.apk
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: python3 -u test/android/media_smoke.py
