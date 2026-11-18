@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:typed_data';
 
 import 'package:archive/archive_io.dart' as ar;
 import 'package:fc_native_video_thumbnail/fc_native_video_thumbnail.dart';
@@ -15,6 +14,10 @@ import 'package:share_plus/share_plus.dart' as sp;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+import 'file_operations.dart';
+import 'storage.dart';
+import 'trash.dart';
+
 const rootPath = '/storage/emulated/0';
 
 // Phien ban ung dung. So ban dung do GitHub tu dien moi lan build.
@@ -23,6 +26,10 @@ const appBuild = String.fromEnvironment('BUILD', defaultValue: '?');
 const blue = Color(0xFF3B82E8);
 final trashDir = Directory('$rootPath/.FMTrash');
 late SharedPreferences prefs;
+final storage = Storage();
+late FileOperations operations;
+late Trash trash;
+final volumeChanges = ValueNotifier<int>(0);
 
 class Cat {
   final String name;
@@ -42,10 +49,9 @@ const cats = <Cat>[
 ];
 
 class Item {
-  final FileSystemEntity e;
-  final FileStat s;
-  Item(this.e, this.s);
-  bool get isDir => e is Directory;
+  final StorageEntry e;
+  Item(this.e);
+  bool get isDir => e.isDir;
   String get name => p.basename(e.path);
 }
 
@@ -83,6 +89,7 @@ Cat? catOf(String path) {
 }
 
 String fmtSize(num b) {
+  if (b < 0) return 'Không rõ';
   if (b < 1024) return '${b.toInt()} B';
   const u = ['KB', 'MB', 'GB', 'TB'];
   var i = -1;
@@ -110,139 +117,110 @@ String uniquePath(String dir, String name) {
   return p.join(dir, '$b ($i)$e');
 }
 
-class CancelledException implements Exception {}
-
 /// Trang thai cua mot tac vu dai (sao chep, nen...), dung cho hop thoai tien trinh.
-class Job {
+class Job implements TransferProgress {
   final progress = ValueNotifier<double>(0);
   final label = ValueNotifier<String>('');
+  final canCancel = ValueNotifier<bool>(true);
   bool cancelled = false;
+
+  @override
+  void check() {
+    if (cancelled) throw TransferCancelled();
+  }
+
+  @override
+  void describe(String text) => label.value = text;
+
+  @override
+  void finishing() {
+    canCancel.value = false;
+    if (total > done) add(total - done);
+    describe('Đang hoàn tất…');
+  }
   int total = 0, done = 0;
   void start(int t) {
     total = t;
     progress.value = t > 0 ? 1e-6 : 0;
   }
 
+  @override
   void add(int n) {
     done += n;
     progress.value = total > 0 ? (done / total).clamp(1e-6, 1.0) : 0;
   }
 }
 
-Future<void> copyEntity(String src, String dest, [Job? job]) async {
-  if (job?.cancelled ?? false) throw CancelledException();
-  if (FileSystemEntity.isDirectorySync(src)) {
-    await Directory(dest).create(recursive: true);
-    await for (final e in Directory(src).list(followLinks: false)) {
-      await copyEntity(e.path, p.join(dest, p.basename(e.path)), job);
-    }
-    return;
-  }
-  if (job == null) {
-    await File(src).copy(dest);
-    return;
-  }
-  job.label.value = p.basename(src);
-  final inp = await File(src).open();
-  final out = await File(dest).open(mode: FileMode.write);
-  var ok = false;
-  try {
-    final buf = Uint8List(1 << 20);
-    while (true) {
-      if (job.cancelled) throw CancelledException();
-      final n = await inp.readInto(buf);
-      if (n <= 0) break;
-      await out.writeFrom(buf, 0, n);
-      job.add(n);
-    }
-    ok = true;
-  } finally {
-    await inp.close();
-    await out.close();
-    if (!ok) {
-      try {
-        await File(dest).delete();
-      } catch (_) {}
-    }
-  }
-}
-
-Future<void> deleteEntity(String src) async {
-  if (FileSystemEntity.isDirectorySync(src)) {
-    await Directory(src).delete(recursive: true);
-  } else {
-    await File(src).delete();
-  }
-}
-
-Future<void> moveEntity(String src, String dest, [Job? job]) async {
-  var renamed = false;
-  try {
-    if (FileSystemEntity.isDirectorySync(src)) {
-      await Directory(src).rename(dest);
-    } else {
-      await File(src).rename(dest);
-    }
-    renamed = true;
-  } catch (_) {}
-  if (renamed) {
-    // Cung o dia: doi cho la xong ngay, cong luon dung luong vao tien trinh.
-    job?.add(await sizeOf(dest));
-    return;
-  }
-  // Khac o dia (vi du sang the nho): phai chep roi xoa ban goc.
-  await copyEntity(src, dest, job);
-  await deleteEntity(src);
-}
-
 Future<int> sizeOf(String path) async {
   try {
-    if (!FileSystemEntity.isDirectorySync(path)) return await File(path).length();
-    var t = 0;
-    await for (final e in Directory(path).list(followLinks: false)) {
-      t += await sizeOf(e.path);
-    }
-    return t;
+    return await storage.size(path);
   } catch (_) {
     return 0;
   }
 }
 
-List<FileSystemEntity>? scanCache;
+final _scanCache = <bool, Future<List<StorageEntry>>>{};
 DateTime scanAt = DateTime(2000);
 
-String sigOf(List<FileSystemEntity> l) {
-  var h = 0;
-  for (final e in l) {
-    h ^= e.path.hashCode;
+void invalidateScan() => _scanCache.clear();
+
+String sigOf(Iterable<String> paths) {
+  var hash = 0, count = 0;
+  for (final path in paths) {
+    hash ^= path.hashCode;
+    count++;
   }
-  return '${l.length}:$h';
+  return '$count:$hash';
 }
 
-Future<List<FileSystemEntity>> scan({bool dirs = false}) async {
-  if (scanCache != null && DateTime.now().difference(scanAt).inSeconds > 30) scanCache = null;
-  if (scanCache == null) {
-    final out = <FileSystemEntity>[];
-    Future<void> walk(Directory d) async {
-      try {
-        await for (final e in d.list(followLinks: false)) {
-          if (p.basename(e.path).startsWith('.')) continue;
-          if (e is Directory) {
-            if (e.path == '$rootPath/Android') continue;
-            out.add(e);
-            await walk(e);
-          } else if (e is File) {
-            out.add(e);
-          }
-        }
-      } catch (_) {}
-    }
-
-    await walk(Directory(rootPath));
-    scanCache = out;
+Future<List<StorageEntry>> scan({bool dirs = false, bool removable = false}) async {
+  if (DateTime.now().difference(scanAt).inSeconds > 30) {
+    invalidateScan();
     scanAt = DateTime.now();
   }
-  return dirs ? List.of(scanCache!) : scanCache!.whereType<File>().toList();
+  final entries = await _scanCache.putIfAbsent(removable, () async {
+    final out = <StorageEntry>[];
+    Future<void> walk(String dir, {String? physicalRoot, Set<String>? seen}) async {
+      try {
+        await for (final entry in storage.children(dir)) {
+          final name = p.basename(entry.path);
+          if (name.startsWith('.')) continue;
+          final physical = physicalRoot == null ? null : p.join(physicalRoot, name);
+          final fresh = physical == null || seen!.add(physical);
+          if (entry.isDir) {
+            if (entry.path == '$rootPath/Android') continue;
+            if (fresh) out.add(entry);
+            await walk(entry.path, physicalRoot: physical, seen: seen);
+          } else if (entry.isFile && fresh) {
+            out.add(entry);
+          }
+        }
+      } catch (_) {
+        // Continue with the next readable directory or volume.
+      }
+    }
+
+    await walk(rootPath);
+    if (removable) {
+      try {
+        final seen = <String>{};
+        for (final volume in await storage.volumes()) {
+          final path = volume.path;
+          if (path == null) continue;
+          try {
+            final real = await storage.identity(path);
+            await walk(path, physicalRoot: real, seen: seen);
+          } catch (_) {
+            // A volume can disappear while the remaining volumes are scanned.
+          }
+        }
+      } catch (_) {
+        // Internal results remain available during a volume change.
+      }
+    }
+    return out;
+  });
+  return dirs ? List.of(entries) : entries.where((entry) => entry.isFile).toList();
 }
 
 const textExts = {'txt', 'md', 'json', 'csv', 'log', 'xml', 'html', 'htm', 'js', 'css', 'dart', 'py', 'java', 'kt', 'yaml', 'yml', 'ini', 'cfg', 'lrc', 'srt'};
@@ -300,7 +278,20 @@ Future<void> runJob(BuildContext context, String title, Job job, Future<void> Fu
             ]),
           ),
         ]),
-        actions: [if (cancellable) TextButton(onPressed: () => job.cancelled = true, child: const Text('Huỷ'))],
+        actions: [
+          if (cancellable)
+            ValueListenableBuilder<bool>(
+              valueListenable: job.canCancel,
+              builder: (_, enabled, __) => TextButton(
+                onPressed: enabled ? () {
+                  job.cancelled = true;
+                  job.canCancel.value = false;
+                  job.describe('Đang huỷ…');
+                } : null,
+                child: const Text('Huỷ'),
+              ),
+            ),
+        ],
       ),
     ),
   );
@@ -312,7 +303,20 @@ Future<void> runJob(BuildContext context, String title, Job job, Future<void> Fu
 }
 
 Future<void> shareFiles(BuildContext context, List<String> paths) async {
-  final files = paths.where((x) => FileSystemEntity.isFileSync(x)).toList();
+  final files = <String>[];
+  for (final path in paths) {
+    if (isSaf(path)) {
+      try {
+        if ((await storage.stat(path))?.isFile == true) files.add(await storage.materialize(path));
+      } catch (error) {
+        if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(storageError(error))));
+        return;
+      }
+    } else if (FileSystemEntity.isFileSync(path)) {
+      files.add(path);
+    }
+  }
+  if (!context.mounted) return;
   if (files.isEmpty) {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Chỉ chia sẻ được tập tin, không chia sẻ được thư mục')));
     return;
@@ -335,56 +339,15 @@ Future<List<int>> dfOf(String path) async {
   }
 }
 
-Future<List<List<String>>> loadVolumes() async {
-  final out = <List<String>>[];
+Map<String, String> getTrash() {
   try {
-    final r = await nativeCh.invokeMethod<List<dynamic>>('volumes');
-    for (final m in r ?? const []) {
-      final mm = m as Map;
-      out.add(['${mm['path']}', '${mm['label']}']);
-    }
-  } catch (_) {}
-  void add(String path) {
-    if (path.startsWith('/storage/emulated') || path == '/storage/self') return;
-    if (out.any((o) => o[0] == path)) return;
-    if (!Directory(path).existsSync()) return;
-    out.add([path, 'Thẻ nhớ ${p.basename(path)}']);
-  }
-
-  for (final v in extVolumes()) {
-    add(v);
-  }
-  // Du phong: doc bang gan ket cua he thong de tim the nho.
-  try {
-    for (final line in File('/proc/mounts').readAsLinesSync()) {
-      final f = line.split(' ');
-      if (f.length < 2) continue;
-      final m = RegExp(r'^/(?:storage|mnt/media_rw)/([^/]+)$').firstMatch(f[1]);
-      if (m != null) add('/storage/${m.group(1)}');
-    }
-  } catch (_) {}
-  return out;
-}
-
-List<String> extVolumes() {
-  try {
-    return Directory('/storage').listSync().whereType<Directory>().map((d) => d.path).where((x) => !x.endsWith('/emulated') && !x.endsWith('/self')).toList();
+    final raw = jsonDecode(prefs.getString('trash') ?? '{}') as Map;
+    return {for (final entry in raw.entries) if (entry.key is String && entry.value is String) entry.key as String: entry.value as String};
   } catch (_) {
-    return [];
+    return {};
   }
 }
 
-Future<List<Item>> withStats(List<FileSystemEntity> es) async {
-  final out = <Item>[];
-  for (final e in es) {
-    try {
-      out.add(Item(e, await e.stat()));
-    } catch (_) {}
-  }
-  return out;
-}
-
-Map<String, String> getTrash() => Map<String, String>.from(jsonDecode(prefs.getString('trash') ?? '{}') as Map);
 List<String> getBm() => prefs.getStringList('bm') ?? [];
 
 /// Vi tri dang xem do cua tung video (mili giay).
@@ -436,6 +399,7 @@ Future<bool> confirm(BuildContext context, String title, String msg, String ok) 
 Widget fileIcon(Item it, {double size = 42}) {
   if (it.isDir) return Icon(Icons.folder, size: size, color: blue);
   final c = catOf(it.e.path);
+  if (isSaf(it.e.path)) return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
   if (c != null && c.name == 'Hình') {
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
@@ -467,6 +431,7 @@ Widget tickMark(bool on) => Container(
 /// Anh vuong lap day o, dung cho luoi hinh va video.
 Widget mediaThumb(String path, double s) {
   final c = catOf(path);
+  if (isSaf(path)) return SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.insert_drive_file, color: c?.color));
   if (c?.name == 'Video') return VideoThumb(key: ValueKey(path), path: path, size: s, square: true);
   return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.image, size: s * 0.5, color: c?.color ?? Colors.grey)));
 }
@@ -615,6 +580,14 @@ class _VideoThumbState extends State<VideoThumb> {
 }
 
 Future<void> openExternal(BuildContext context, String path) async {
+  if (isSaf(path)) {
+    try {
+      await storage.openDocument(path);
+    } catch (error) {
+      if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không mở được: ${storageError(error)}')));
+    }
+    return;
+  }
   if (extOf(path) == 'apk' && !await Permission.requestInstallPackages.isGranted) {
     if (!(await Permission.requestInstallPackages.request()).isGranted) {
       if (context.mounted) {
@@ -631,7 +604,29 @@ Future<void> openExternal(BuildContext context, String path) async {
 
 Future<void> openFile(BuildContext context, String path, {List<String>? siblings}) async {
   final c = catOf(path)?.name;
-  var list = siblings ?? [path];
+  if (isSaf(path)) {
+    if (c != 'Video' && c != 'Âm thanh' && c != 'Hình') {
+      await openExternal(context, path);
+      return;
+    }
+    String? local;
+    try {
+      local = await storage.materialize(path);
+      if (context.mounted) await openFile(context, local);
+    } catch (error) {
+      if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không mở được: ${storageError(error)}')));
+    } finally {
+      if (local != null) {
+        try {
+          await Directory(p.dirname(local)).delete(recursive: true);
+        } on FileSystemException {
+          // Startup cleanup can retry after the viewer closes its handles.
+        }
+      }
+    }
+    return;
+  }
+  var list = siblings?.where((item) => !isSaf(item)).toList() ?? [path];
   var idx = list.indexOf(path);
   if (idx < 0) {
     list = [path];
@@ -662,7 +657,37 @@ Future<void> openFile(BuildContext context, String path, {List<String>? siblings
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   prefs = await SharedPreferences.getInstance();
+  final privatePath = Platform.isAndroid
+      ? (await storageChannel.invokeMethod<String>('privateDir'))!
+      : Directory.systemTemp.path;
+  operations = FileOperations(storage, Directory(p.join(privatePath, 'fm-transactions')));
+  trash = Trash(operations, Directory(p.join(privatePath, 'fm-trash')), trashDir, rootPath, getTrash, (path) async {
+    final old = getTrash()..remove(path);
+    if (!await prefs.setString('trash', jsonEncode(old))) {
+      throw FileSystemException('Không thể cập nhật thông tin thùng rác', path);
+    }
+  });
+  storageChannel.setMethodCallHandler((call) async {
+    if (call.method == 'changed') {
+      invalidateScan();
+      volumeChanges.value++;
+    }
+  });
+  unawaited(_cleanOpenedDocuments());
   runApp(const App());
+}
+
+Future<void> _cleanOpenedDocuments() async {
+  try {
+    await for (final entry in Directory.systemTemp.list(followLinks: false)) {
+      if (entry is Directory && p.basename(entry.path).startsWith('fm-open-') &&
+          DateTime.now().difference((await entry.stat()).modified) > const Duration(days: 1)) {
+        await entry.delete(recursive: true);
+      }
+    }
+  } on FileSystemException {
+    // Cache cleanup is independent of the file manager's storage operations.
+  }
 }
 
 class App extends StatelessWidget {
@@ -691,23 +716,25 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomeState();
 }
 
-class _HomeState extends State<HomePage> {
+class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   bool? granted;
   int total = 0, used = 0;
-  List<List<String>> vols = [];
-  Map<String, List<int>> volUse = {};
+  List<StorageVolume> vols = [];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    volumeChanges.addListener(_volumesChanged);
     _init();
   }
 
   Future<void> _init() async {
     final g = await ensurePerm();
     if (g) await _df();
-    await _loadVols();
     if (mounted) setState(() => granted = g);
+    await _refreshVolumes();
+    await _recover();
   }
 
   Future<void> _df() async {
@@ -716,18 +743,56 @@ class _HomeState extends State<HomePage> {
     used = r[1];
   }
 
-  Future<void> _loadVols() async {
-    final v = await loadVolumes();
-    final u = <String, List<int>>{};
-    for (final x in v) {
-      u[x[0]] = await dfOf(x[0]);
-    }
-    vols = v;
-    volUse = u;
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    volumeChanges.removeListener(_volumesChanged);
+    super.dispose();
   }
 
-  Widget _storage(String title, int total, int used, VoidCallback onTap) {
-    final pct = total > 0 ? used / total : 0.0;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && granted != null) _volumesChanged();
+  }
+
+  void _volumesChanged() {
+    unawaited(_refreshVolumes());
+    unawaited(_recover());
+  }
+
+  Future<void> _recover() async {
+    try {
+      final errors = await operations.recover();
+      if (mounted && errors.isNotEmpty) _message('Chưa thể phục hồi thao tác: ${errors.first}');
+    } catch (error) {
+      if (mounted) _message('Không đọc được nhật ký thao tác: ${storageError(error)}');
+    }
+  }
+
+  Future<void> _refreshVolumes() async {
+    try {
+      final found = await storage.volumes();
+      if (mounted) setState(() => vols = found);
+    } catch (error) {
+      if (mounted) _message('Không đọc được danh sách SD/USB: ${storageError(error)}');
+    }
+  }
+
+  void _message(String text) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+
+  Future<void> _grantVolume([String? id]) async {
+    try {
+      final path = await storage.grant(id);
+      if (path == null || !mounted) return;
+      await _refreshVolumes();
+      if (mounted) _open(BrowserPage(mode: Mode.dir, path: path));
+    } catch (error) {
+      if (mounted) _message(storageError(error));
+    }
+  }
+
+  Widget _storage(String title, int total, int used, VoidCallback onTap, {int? free, String? hint}) {
+    final pct = total > 0 ? (used / total).clamp(0.0, 1.0) : 0.0;
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
       child: InkWell(
@@ -744,7 +809,9 @@ class _HomeState extends State<HomePage> {
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600)),
-                Text(total > 0 ? '${fmtSize(used)}/${fmtSize(total)}' : 'Bấm để mở', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                Text(total > 0 ? '${fmtSize(used)}/${fmtSize(total)}' : hint ?? 'Bấm để mở', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                if (free != null && total > 0) Text('Trống ${fmtSize(free)}', style: const TextStyle(fontSize: 12)),
+                if (hint != null && total > 0) Text(hint, style: const TextStyle(fontSize: 12)),
               ]),
             ),
           ]),
@@ -753,9 +820,14 @@ class _HomeState extends State<HomePage> {
     );
   }
 
-  Widget _volCard(List<String> v) {
-    final u = volUse[v[0]] ?? const [0, 0];
-    return _storage(v[1], u[0], u[1], () => _open(BrowserPage(mode: Mode.dir, path: v[0])));
+  Widget _volCard(StorageVolume volume) {
+    final path = volume.path;
+    return _storage(
+      volume.label, volume.total, volume.total - volume.free,
+      path == null ? () => _grantVolume(volume.id) : () => _open(BrowserPage(mode: Mode.dir, path: path)),
+      free: volume.free,
+      hint: path == null ? 'Chọn thư mục để cấp quyền' : (volume.writable ? null : 'Chỉ đọc'),
+    );
   }
 
   Widget _analyzer() => Card(
@@ -782,8 +854,7 @@ class _HomeState extends State<HomePage> {
   void _open(Widget w) {
     Navigator.push(context, MaterialPageRoute(builder: (_) => w)).then((_) async {
       await _df();
-      await _loadVols();
-      if (mounted) setState(() {});
+      await _refreshVolumes();
     });
   }
 
@@ -806,6 +877,15 @@ class _HomeState extends State<HomePage> {
 
   Widget _sec(String t) => Padding(padding: const EdgeInsets.only(bottom: 6), child: Align(alignment: Alignment.centerLeft, child: Text(t, style: const TextStyle(color: blue, fontWeight: FontWeight.w600))));
 
+  Widget _categoryTiles() => _card(_grid([
+    for (final category in cats)
+      _tile(category.icon, category.name, category.color, () => _open(
+        category.name == 'Hình' || category.name == 'Video'
+            ? MediaCatPage(cat: category)
+            : BrowserPage(mode: Mode.cat, cat: category),
+      )),
+  ]));
+
   @override
   Widget build(BuildContext context) {
     Widget body;
@@ -813,21 +893,27 @@ class _HomeState extends State<HomePage> {
       body = const Center(child: CircularProgressIndicator());
     } else if (granted == false) {
       body = Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.lock, size: 56, color: Colors.grey),
-            const SizedBox(height: 12),
-            const Text('Ứng dụng cần quyền truy cập bộ nhớ để hiển thị tập tin.', textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            FilledButton(onPressed: _init, child: const Text('Cấp quyền')),
-            TextButton(onPressed: openAppSettings, child: const Text('Mở cài đặt ứng dụng')),
-          ]),
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.lock, size: 56, color: Colors.grey),
+              const SizedBox(height: 12),
+              const Text('Ứng dụng cần quyền truy cập bộ nhớ để hiển thị tập tin.', textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              FilledButton(onPressed: _init, child: const Text('Cấp quyền')),
+              TextButton(onPressed: openAppSettings, child: const Text('Mở cài đặt ứng dụng')),
+              for (final volume in vols) _volCard(volume),
+              if (vols.any((volume) => volume.path != null)) ...[
+                _categoryTiles(),
+                TextButton(onPressed: () => _open(const BrowserPage(mode: Mode.trash)), child: const Text('Thùng rác')),
+              ],
+            ]),
+          ),
         ),
       );
     } else {
-      final pct = total > 0 ? used / total : 0.0;
-      final bm = getBm().where(existsPath).toList();
+      final bm = getBm().where((path) => isSaf(path) ? vols.any((v) => v.path != null && inDirectory(v.path!, path)) : existsPath(path)).toList();
       void soon() => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Tính năng mạng chưa được hỗ trợ')));
       body = ListView(padding: const EdgeInsets.all(10), children: [
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -837,7 +923,7 @@ class _HomeState extends State<HomePage> {
         ]),
         for (var i = 1; i < vols.length; i++) _volCard(vols[i]),
         if (vols.isNotEmpty) _analyzer(),
-        _card(_grid([for (final c in cats) _tile(c.icon, c.name, c.color, () => _open(c.name == 'Hình' || c.name == 'Video' ? MediaCatPage(cat: c) : BrowserPage(mode: Mode.cat, cat: c)))])),
+        _categoryTiles(),
         _card(Column(children: [
           _sec('Mạng'),
           _grid([
@@ -864,8 +950,8 @@ class _HomeState extends State<HomePage> {
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.star, color: Color(0xFFF2B63C)),
-              title: Text(p.basename(b)),
-              subtitle: Text(b, maxLines: 1, overflow: TextOverflow.ellipsis),
+              title: Text(storageDisplayName(b)),
+              subtitle: Text(storageDisplayPath(b), maxLines: 1, overflow: TextOverflow.ellipsis),
               onTap: () => _open(BrowserPage(mode: Mode.dir, path: b)),
             ),
         ])),
@@ -879,7 +965,9 @@ class _HomeState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('Trang chủ'),
         actions: [
-          if (granted == true) IconButton(tooltip: 'Tìm kiếm', icon: const Icon(Icons.search), onPressed: () => _open(const BrowserPage(mode: Mode.search))),
+          if (granted != null && vols.isNotEmpty)
+            IconButton(tooltip: 'Cấp quyền thư mục SD/USB', icon: const Icon(Icons.sd_storage), onPressed: _grantVolume),
+          if (granted == true || vols.any((volume) => volume.path != null)) IconButton(tooltip: 'Tìm kiếm', icon: const Icon(Icons.search), onPressed: () => _open(const BrowserPage(mode: Mode.search))),
         ],
       ),
       body: body,
@@ -924,6 +1012,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    volumeChanges.addListener(_volumeChanged);
     _load();
     // Tu kiem tra thu muc dang mo moi 3 giay de hien tap tin moi.
     if (isDir) _poll = Timer.periodic(const Duration(seconds: 3), (_) => _check());
@@ -934,15 +1023,21 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     _poll?.cancel();
     _deb?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    volumeChanges.removeListener(_volumeChanged);
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && mounted && !loading) {
-      scanCache = null;
+      invalidateScan();
       _load(silent: true);
     }
+  }
+
+  void _volumeChanged() {
+    if (!mounted) return;
+    if (!isDir || !inDirectory(rootPath, cur)) unawaited(_load(silent: true));
   }
 
   Future<void> _check() async {
@@ -951,10 +1046,19 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     _checking = true;
     try {
       final at = cur;
-      final raw = await Directory(at).list(followLinks: false).toList();
-      if (mounted && !loading && at == cur && sigOf(raw) != _lastSig) await _load(silent: true);
-    } catch (_) {}
-    _checking = false;
+      await storage.available(at);
+      final paths = isSaf(at)
+          ? await storage.children(at).map((entry) => entry.path).toList()
+          : await Directory(at).list(followLinks: false).map((entry) => entry.path).toList();
+      if (mounted && !loading && at == cur &&
+          (_directoryUnavailable || sigOf(paths.where(_visible)) != _lastSig)) {
+        await _load(silent: true);
+      }
+    } catch (_) {
+      if (mounted && !_directoryUnavailable) await _load(silent: true);
+    } finally {
+      _checking = false;
+    }
   }
 
   void _msg(String m) {
@@ -964,42 +1068,53 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       ..showSnackBar(SnackBar(content: Text(m)));
   }
 
+  bool _directoryUnavailable = false;
+
+  bool _visible(String path) {
+    final name = p.basename(path);
+    return !privateStorageName(name) && (hidden || !name.startsWith('.'));
+  }
+
+  Future<List<StorageEntry>> _visibleChildren(String path) async {
+    await storage.available(path);
+    return storage.children(path).where((entry) => _visible(entry.path)).toList();
+  }
+
   Future<void> _load({bool silent = false}) async {
     if (!silent) setState(() => loading = true);
     final gen = ++_gen;
-    var es = <FileSystemEntity>[];
+    var entries = <StorageEntry>[];
+    var unavailable = false;
     try {
       switch (widget.mode) {
         case Mode.dir:
-          final raw = await Directory(cur).list(followLinks: false).toList();
-          _lastSig = sigOf(raw);
-          es = raw.where((e) {
-            final n = p.basename(e.path);
-            return n != '.FMTrash' && (hidden || !n.startsWith('.'));
-          }).toList();
+          entries = await _visibleChildren(cur);
         case Mode.cat:
-          es = (await scan()).where((e) => widget.cat!.exts.contains(extOf(e.path)) && (widget.only == null || p.dirname(e.path) == widget.only)).toList();
+          entries = (await scan(removable: true)).where((e) => widget.cat!.exts.contains(extOf(e.path)) && (widget.only == null || p.dirname(e.path) == widget.only)).toList();
         case Mode.recent:
-          es = await scan();
+          entries = await scan();
         case Mode.search:
-          final s = noAccent(q.trim());
-          es = s.isEmpty ? [] : (await scan(dirs: true)).where((e) => noAccent(p.basename(e.path)).contains(s)).toList();
+          final term = noAccent(q.trim());
+          entries = term.isEmpty ? [] : (await scan(dirs: true, removable: true)).where((e) => noAccent(p.basename(e.path)).contains(term)).toList();
         case Mode.trash:
-          if (await trashDir.exists()) es = await trashDir.list(followLinks: false).toList();
+          entries = await trash.list();
       }
-    } catch (e) {
-      _msg('Không đọc được thư mục: $e');
+    } catch (error) {
+      unavailable = isDir;
+      if (gen == _gen && (!_directoryUnavailable || !silent)) _msg('Không đọc được thư mục: ${storageError(error)}');
     }
-    var out = await withStats(es);
+    var out = entries.map(Item.new).toList();
     if (widget.mode == Mode.recent) {
-      out.sort((a, b) => b.s.modified.compareTo(a.s.modified));
+      out.sort((a, b) => b.e.modified.compareTo(a.e.modified));
       out = out.take(50).toList();
     } else {
       _sort(out);
     }
     if (!mounted) return;
-    if (widget.mode == Mode.search && gen != _gen) return;
+    if (gen != _gen) return;
     setState(() {
+      _directoryUnavailable = unavailable;
+      if (isDir) _lastSig = sigOf(entries.map((entry) => entry.path));
       items = out;
       loading = false;
       if (silent) {
@@ -1016,9 +1131,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     int c(Item a, Item b) {
       switch (sort) {
         case 'date':
-          return b.s.modified.compareTo(a.s.modified);
+          return b.e.modified.compareTo(a.e.modified);
         case 'size':
-          return b.s.size.compareTo(a.s.size);
+          return b.e.size.compareTo(a.e.size);
         case 'type':
           final r = extOf(a.e.path).compareTo(extOf(b.e.path));
           return r != 0 ? r : byName(a, b);
@@ -1038,9 +1153,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       await f();
       _msg(ok);
     } catch (e) {
-      _msg('Lỗi: $e');
+      _msg('Lỗi: ${storageError(e)}');
     }
-    scanCache = null;
+    invalidateScan();
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1049,7 +1164,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
 
   bool _badName(String? s) {
     if (s == null) return true;
-    if (s.isEmpty || s.contains('/')) {
+    if (s.isEmpty || s == '.' || s == '..' || s.contains('/') || s.contains('\u0000') || privateStorageName(s)) {
       _msg('Tên không hợp lệ');
       return true;
     }
@@ -1059,63 +1174,78 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   Future<void> _newFolder() async {
     final s = await prompt(context, 'Thư mục mới', 'Thư mục mới');
     if (_badName(s)) return;
-    await _run(() async => Directory(uniquePath(cur, s!)).create(), 'Đã tạo thư mục');
+    await _run(() => operations.exclusive(() async {
+      await storage.available(cur);
+      await storage.createDirectory(await storage.unique(cur, s!));
+    }), 'Đã tạo thư mục');
   }
 
   Future<void> _newFile() async {
     final s = await prompt(context, 'Tập tin văn bản mới', 'Ghi chú mới.txt');
     if (_badName(s)) return;
-    await _run(() async => File(uniquePath(cur, s!)).create(), 'Đã tạo tập tin');
+    await _run(() => operations.exclusive(() async {
+      await storage.available(cur);
+      final stream = await storage.open(await storage.unique(cur, s!), write: true);
+      await stream.close();
+    }), 'Đã tạo tập tin');
   }
 
   Future<void> _rename(String path) async {
     final s = await prompt(context, 'Đổi tên', p.basename(path));
     if (_badName(s) || s == p.basename(path)) return;
     final dest = p.join(p.dirname(path), s!);
-    if (existsPath(dest)) {
-      _msg('Tên này đã tồn tại');
-      return;
+    await _run(() async { await operations.move(path, dest, fast: true); }, 'Đã đổi tên');
+  }
+
+  Future<void> _trashBatch(
+    List<String> paths, String title, String success, Future<void> Function(String) apply,
+  ) async {
+    final job = Job();
+    final errors = <String>[];
+    var completed = 0;
+    await runJob(context, title, job, () async {
+      job.start(paths.length);
+      for (final path in paths) {
+        if (job.cancelled) break;
+        job.describe(p.basename(path));
+        try {
+          await apply(path);
+          completed++;
+        } catch (error) {
+          errors.add('${p.basename(path)}: ${storageError(error)}');
+        }
+        job.add(1);
+      }
+    });
+    final result = '$success $completed/${paths.length} mục';
+    if (errors.isNotEmpty && mounted) {
+      await showDialog<void>(
+        context: context,
+        builder: (dialog) => AlertDialog(
+          title: Text(result),
+          content: SingleChildScrollView(child: Text(errors.join('\n'))),
+          actions: [TextButton(onPressed: () => Navigator.pop(dialog), child: const Text('Đóng'))],
+        ),
+      );
+    } else {
+      _msg(job.cancelled ? '$result. Đã huỷ phần còn lại' : result);
     }
-    await _run(() => moveEntity(path, dest), 'Đã đổi tên');
+    invalidateScan();
+    if (mounted) await _load();
   }
 
   Future<void> _delete(List<String> paths) async {
-    if (!await confirm(context, 'Xoá ${paths.length} mục?', 'Các mục sẽ vào Thùng rác và có thể khôi phục.', 'Xoá')) return;
-    await _run(() async {
-      await trashDir.create(recursive: true);
-      final m = getTrash();
-      for (final s in paths) {
-        final d = uniquePath(trashDir.path, p.basename(s));
-        await moveEntity(s, d);
-        m[d] = s;
-      }
-      await prefs.setString('trash', jsonEncode(m));
-    }, 'Đã chuyển vào Thùng rác');
+    final selected = FileOperations.selection(paths);
+    if (!await confirm(context, 'Xoá ${selected.length} mục?', 'Các mục sẽ vào Thùng rác và có thể khôi phục.', 'Xoá') || !mounted) return;
+    await _trashBatch(selected, 'Đang chuyển vào Thùng rác', 'Đã chuyển vào Thùng rác', trash.put);
   }
 
-  Future<void> _restore(List<String> paths) async {
-    await _run(() async {
-      final m = getTrash();
-      for (final s in paths) {
-        final orig = m[s] ?? p.join(rootPath, p.basename(s));
-        await Directory(p.dirname(orig)).create(recursive: true);
-        await moveEntity(s, uniquePath(p.dirname(orig), p.basename(orig)));
-        m.remove(s);
-      }
-      await prefs.setString('trash', jsonEncode(m));
-    }, 'Đã khôi phục');
-  }
+  Future<void> _restore(List<String> paths) =>
+      _trashBatch(paths, 'Đang khôi phục', 'Đã khôi phục', trash.restore);
 
   Future<void> _purge(List<String> paths) async {
-    if (!await confirm(context, 'Xoá hẳn ${paths.length} mục?', 'Không thể khôi phục sau khi xoá hẳn.', 'Xoá hẳn')) return;
-    await _run(() async {
-      final m = getTrash();
-      for (final s in paths) {
-        await deleteEntity(s);
-        m.remove(s);
-      }
-      await prefs.setString('trash', jsonEncode(m));
-    }, 'Đã xoá hẳn');
+    if (!await confirm(context, 'Xoá hẳn ${paths.length} mục?', 'Không thể khôi phục sau khi xoá hẳn.', 'Xoá hẳn') || !mounted) return;
+    await _trashBatch(paths, 'Đang xoá hẳn', 'Đã xoá hẳn', trash.purge);
   }
 
   void _toClip(List<String> paths, bool cut) {
@@ -1131,71 +1261,57 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   Future<void> _paste() async {
     final c = clip.value;
     if (c == null) return;
-    for (final s in c.paths) {
-      if (s == cur || p.isWithin(s, cur)) {
-        _msg('Không thể dán thư mục vào chính nó');
-        return;
+    final directory = cur;
+    var conflicts = 0;
+    try {
+      await storage.available(directory);
+      for (final source in c.paths) {
+        if (p.dirname(source) != directory &&
+            await storage.stat(p.join(directory, p.basename(source))) != null) conflicts++;
       }
+    } catch (error) {
+      _msg('Lỗi: ${storageError(error)}');
+      return;
     }
-    final srcs = c.paths.where(existsPath).toList();
-    final conflicts = srcs.where((s) => p.dirname(s) != cur && existsPath(p.join(cur, p.basename(s)))).length;
-    var mode = 'keep';
+    if (!mounted || cur != directory || clip.value != c) return;
+    var mode = Conflict.keep;
     if (conflicts > 0) {
-      final r = await showDialog<String>(
+      final choice = await showDialog<Conflict>(
         context: context,
         builder: (d) => AlertDialog(
           title: Text('$conflicts mục trùng tên'),
-          content: const Text('Thư mục này đã có mục cùng tên. Bạn muốn xử lý thế nào?'),
+          content: const Text('Ghi đè thư mục sẽ gộp nội dung và giữ lại các mục chỉ có ở đích.'),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(d, 'skip'), child: const Text('Bỏ qua')),
-            TextButton(onPressed: () => Navigator.pop(d, 'keep'), child: const Text('Giữ cả hai')),
-            FilledButton(onPressed: () => Navigator.pop(d, 'overwrite'), child: const Text('Ghi đè')),
+            TextButton(onPressed: () => Navigator.pop(d, Conflict.skip), child: const Text('Bỏ qua')),
+            TextButton(onPressed: () => Navigator.pop(d, Conflict.keep), child: const Text('Giữ cả hai')),
+            FilledButton(onPressed: () => Navigator.pop(d, Conflict.overwrite), child: const Text('Ghi đè')),
           ],
         ),
       );
-      if (r == null || !mounted) return;
-      mode = r;
+      if (choice == null || !mounted || cur != directory || clip.value != c) return;
+      mode = choice;
     }
-    clip.value = null;
     final job = Job();
-    String result = '';
+    var result = '';
     await runJob(context, c.cut ? 'Đang di chuyển' : 'Đang sao chép', job, () async {
       try {
         var total = 0;
-        for (final s in srcs) {
-          total += await sizeOf(s);
+        for (final source in FileOperations.selection(c.paths)) {
+          await storage.available(source);
+          total += await storage.size(source, check: job.check);
         }
         job.start(total);
-        var n = 0;
-        for (final s in srcs) {
-          final same = p.dirname(s) == cur;
-          if (c.cut && same) continue;
-          var dest = p.join(cur, p.basename(s));
-          if (existsPath(dest)) {
-            if (same || mode == 'keep' || p.isWithin(dest, s)) {
-              dest = uniquePath(cur, p.basename(s));
-            } else if (mode == 'skip') {
-              continue;
-            } else {
-              await deleteEntity(dest);
-            }
-          }
-          if (c.cut) {
-            await moveEntity(s, dest, job);
-          } else {
-            await copyEntity(s, dest, job);
-          }
-          n++;
-        }
-        result = c.cut ? 'Đã di chuyển $n mục' : 'Đã sao chép $n mục';
-      } on CancelledException {
+        final count = await operations.paste(c.paths, directory, move: c.cut, conflict: mode, progress: job);
+        if (clip.value == c) clip.value = null;
+        result = c.cut ? 'Đã di chuyển $count mục' : 'Đã sao chép $count mục';
+      } on TransferCancelled {
         result = 'Đã huỷ';
-      } catch (e) {
-        result = 'Lỗi: $e';
+      } catch (error) {
+        result = 'Lỗi: ${storageError(error)}';
       }
     });
     _msg(result);
-    scanCache = null;
+    invalidateScan();
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1203,6 +1319,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   }
 
   Future<void> _extract(String path) async {
+    if (isSaf(path)) {
+      await openExternal(context, path);
+      return;
+    }
     final out = uniquePath(p.dirname(path), archiveBase(path));
     final job = Job()..label.value = p.basename(path);
     String result = '';
@@ -1215,7 +1335,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       }
     }, cancellable: false);
     _msg(result);
-    scanCache = null;
+    invalidateScan();
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1224,6 +1344,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
 
   Future<void> _zip(List<String> paths) async {
     if (paths.isEmpty) return;
+    if (paths.any(isSaf) || (isDir && isSaf(cur))) {
+      _msg('Hãy sao chép các mục vào bộ nhớ trong để nén ZIP');
+      return;
+    }
     final dir = isDir ? cur : p.dirname(paths.first);
     final def = paths.length == 1 ? '${p.basenameWithoutExtension(paths.first)}.zip' : 'Tập tin nén.zip';
     var s = await prompt(context, 'Nén thành zip', def);
@@ -1244,7 +1368,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       }
     }, cancellable: false);
     _msg(result);
-    scanCache = null;
+    invalidateScan();
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1263,9 +1387,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
         content: Column(mainAxisSize: MainAxisSize.min, children: [
           row('Tên', Text(it.name)),
           row('Loại', Text(it.isDir ? 'Thư mục' : (catOf(it.e.path)?.name ?? 'Tập tin'))),
-          row('Vị trí', Text(p.dirname(it.e.path))),
+          row('Vị trí', Text(storageDisplayPath(p.dirname(it.e.path)))),
           row('Kích thước', FutureBuilder<int>(future: sizeOf(it.e.path), builder: (_, s) => Text(s.hasData ? fmtSize(s.data!) : 'Đang tính...'))),
-          row('Sửa đổi', Text(fmtDate(it.s.modified))),
+          row('Sửa đổi', Text(fmtDate(it.e.modified))),
         ]),
         actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('Đóng'))],
       ),
@@ -1283,7 +1407,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       return;
     }
     final path = it.e.path;
-    if (isArchive(path)) {
+    if (!isSaf(path) && isArchive(path)) {
       if (await confirm(context, 'Giải nén?', 'Giải nén "${it.name}" vào một thư mục mới cùng chỗ.', 'Giải nén')) await _extract(path);
       return;
     }
@@ -1317,8 +1441,8 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
               o(Icons.open_in_new, 'Mở', () => _openItem(it)),
               if (!it.isDir) o(Icons.apps, 'Mở bằng ứng dụng khác', () => openExternal(context, path)),
               if (!it.isDir) o(Icons.share, 'Chia sẻ', () => shareFiles(context, [path])),
-              if (isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
-              o(Icons.archive, 'Nén thành zip', () => _zip([path])),
+              if (!isSaf(path) && isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
+              if (!isSaf(path)) o(Icons.archive, 'Nén thành zip', () => _zip([path])),
               o(Icons.edit, 'Đổi tên', () => _rename(path)),
               if (clip.value == null) o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
               if (clip.value == null) o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
@@ -1349,16 +1473,16 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   }
 
   String _sub(Item it) {
-    final a = it.isDir ? 'Thư mục' : fmtSize(it.s.size);
-    return isDir ? '$a | ${fmtDate(it.s.modified)}' : '$a | ${p.dirname(it.e.path).replaceFirst(rootPath, 'Bộ nhớ trong')}';
+    final a = it.isDir ? 'Thư mục' : fmtSize(it.e.size);
+    return isDir ? '$a | ${fmtDate(it.e.modified)}' : '$a | ${storageDisplayPath(p.dirname(it.e.path))}';
   }
 
   String get _title {
     switch (widget.mode) {
       case Mode.dir:
-        return cur == rootPath ? 'Bộ nhớ trong' : p.basename(cur);
+        return cur == rootPath ? 'Bộ nhớ trong' : storageDisplayName(cur);
       case Mode.cat:
-        return widget.only != null ? p.basename(widget.only!) : widget.cat!.name;
+        return widget.only != null ? storageDisplayName(widget.only!) : widget.cat!.name;
       case Mode.recent:
         return 'Gần đây';
       case Mode.trash:
@@ -1369,8 +1493,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   }
 
   PreferredSizeWidget? _crumbs() {
-    if (!isDir || sel.isNotEmpty || !p.isWithin(rootPath, cur)) return null;
-    final parts = p.split(p.relative(cur, from: rootPath));
+    final base = inDirectory(rootPath, cur) ? rootPath : widget.path;
+    if (!isDir || sel.isNotEmpty || !p.isWithin(base, cur)) return null;
+    final parts = p.split(p.relative(cur, from: base));
     Widget b(String t, String path) => TextButton(
         onPressed: path == cur
             ? null
@@ -1387,10 +1512,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
           scrollDirection: Axis.horizontal,
           reverse: true,
           child: Row(children: [
-            b('Bộ nhớ trong', rootPath),
+            b(base == rootPath ? 'Bộ nhớ trong' : storageDisplayName(base), base),
             for (var i = 0; i < parts.length; i++) ...[
               const Icon(Icons.chevron_right, color: Colors.white70, size: 18),
-              b(parts[i], p.joinAll([rootPath, ...parts.sublist(0, i + 1)])),
+              b(parts[i], p.joinAll([base, ...parts.sublist(0, i + 1)])),
             ],
           ]),
         ),
@@ -1410,7 +1535,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       body = const Center(child: CircularProgressIndicator());
     } else if (items.isEmpty) {
       final t = {
-        Mode.dir: 'Thư mục trống. Nhấn + để thêm.',
+        Mode.dir: _directoryUnavailable ? 'Không truy cập được thư mục. Hãy kiểm tra kết nối và quyền SD/USB.' : 'Thư mục trống. Nhấn + để thêm.',
         Mode.cat: 'Chưa có tập tin nào thuộc loại này.',
         Mode.recent: 'Chưa có tập tin nào.',
         Mode.trash: 'Thùng rác trống.',
@@ -1468,7 +1593,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                     padding: const EdgeInsets.symmetric(horizontal: 2),
                     child: Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(fontSize: 14, height: 1.15)),
                   ),
-                  if (!it.isDir) Text(fmtSize(it.s.size), maxLines: 1, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                  if (!it.isDir) Text(fmtSize(it.e.size), maxLines: 1, style: const TextStyle(fontSize: 11, color: Colors.grey)),
                 ]);
               }),
             ),
@@ -1573,7 +1698,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       } else if (v == 'empty') {
                         _purge(items.map((i) => i.e.path).toList());
                       } else if (v == 'refresh') {
-                        scanCache = null;
+                        invalidateScan();
                         _load();
                       } else if (v == 'hidden') {
                         hidden = !hidden;
@@ -1600,7 +1725,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                 ],
         ),
         body: body,
-        floatingActionButton: isDir && !selecting
+        floatingActionButton: isDir && !selecting && !_directoryUnavailable
             ? ValueListenableBuilder<FmClip?>(
                 valueListenable: clip,
                 builder: (_, c, __) => c != null
@@ -1633,7 +1758,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       ),
               )
             : null,
-        bottomNavigationBar: isDir
+        bottomNavigationBar: isDir && !_directoryUnavailable
             ? ValueListenableBuilder<FmClip?>(
                 valueListenable: clip,
                 builder: (_, c, __) => c == null
@@ -1668,7 +1793,7 @@ class StatsPage extends StatefulWidget {
 }
 
 class _StatsState extends State<StatsPage> {
-  late final Future<List<Item>> future = scan().then(withStats);
+  late final Future<List<Item>> future = scan().then((entries) => entries.map(Item.new).toList());
 
   @override
   Widget build(BuildContext context) {
@@ -1679,13 +1804,13 @@ class _StatsState extends State<StatsPage> {
         builder: (_, s) {
           if (!s.hasData) return const Center(child: CircularProgressIndicator());
           final fs = s.data!;
-          final tot = fs.fold<int>(0, (a, i) => a + i.s.size);
+          final tot = fs.fold<int>(0, (a, i) => a + i.e.size);
           final by = <String, int>{for (final c in cats) c.name: 0, 'Khác': 0};
           for (final i in fs) {
             final k = catOf(i.e.path)?.name ?? 'Khác';
-            by[k] = by[k]! + i.s.size;
+            by[k] = by[k]! + i.e.size;
           }
-          fs.sort((a, b) => b.s.size.compareTo(a.s.size));
+          fs.sort((a, b) => b.e.size.compareTo(a.e.size));
           Color col(String k) => cats.where((c) => c.name == k).map((c) => c.color).firstWhere((_) => true, orElse: () => Colors.grey);
           return ListView(padding: const EdgeInsets.all(12), children: [
             const Text('Dung lượng theo loại', style: TextStyle(color: blue, fontWeight: FontWeight.w600)),
@@ -1706,7 +1831,7 @@ class _StatsState extends State<StatsPage> {
                 contentPadding: EdgeInsets.zero,
                 leading: SizedBox(width: 42, height: 42, child: fileIcon(it)),
                 title: Text(it.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text('${fmtSize(it.s.size)} | ${p.dirname(it.e.path).replaceFirst(rootPath, 'Bộ nhớ trong')}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                subtitle: Text('${fmtSize(it.e.size)} | ${storageDisplayPath(p.dirname(it.e.path))}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
                 onTap: () => openFile(context, it.e.path),
               ),
           ]);
@@ -2119,7 +2244,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && mounted) {
-      scanCache = null;
+      invalidateScan();
       _load();
     }
   }
@@ -2127,6 +2252,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    volumeChanges.removeListener(_volumeChanged);
     super.dispose();
   }
 
@@ -2140,19 +2266,25 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    volumeChanges.addListener(_volumeChanged);
     _load();
   }
 
+  int _loadGeneration = 0;
+
+  void _volumeChanged() => unawaited(_load());
+
   Future<void> _load() async {
-    final its = await withStats((await scan()).where((e) => widget.cat.exts.contains(extOf(e.path))).toList());
-    its.sort((a, b) => b.s.modified.compareTo(a.s.modified));
+    final generation = ++_loadGeneration;
+    final its = (await scan(removable: true)).where((e) => widget.cat.exts.contains(extOf(e.path))).map(Item.new).toList();
+    its.sort((a, b) => b.e.modified.compareTo(a.e.modified));
     final fs = its.map((i) => i.e.path).toList();
     final m = <String, List<String>>{};
     for (final x in fs) {
       m.putIfAbsent(p.dirname(x), () => []).add(x);
     }
     final g = m.entries.toList();
-    if (!mounted) return;
+    if (!mounted || generation != _loadGeneration) return;
     setState(() {
       all = fs;
       groups = g;
@@ -2161,6 +2293,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
   }
 
   Widget _thumb(String path, double s) {
+    if (isSaf(path)) return mediaThumb(path, s);
     if (isVideo) return VideoThumb(key: ValueKey(path), path: path, size: s);
     return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 360, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(widget.cat.icon, size: s * 0.5, color: widget.cat.color)));
   }
@@ -2184,7 +2317,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
         itemCount: groups.length,
         itemBuilder: (_, i) {
           final g = groups[i];
-          final name = g.key == rootPath ? 'Bộ nhớ trong' : p.basename(g.key);
+          final name = g.key == rootPath ? 'Bộ nhớ trong' : storageDisplayName(g.key);
           return InkWell(
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BrowserPage(mode: Mode.cat, cat: widget.cat, only: g.key))).then((_) => _load()),
             child: ClipRRect(
@@ -2234,7 +2367,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
               tooltip: 'Làm mới',
               icon: const Icon(Icons.refresh),
               onPressed: () {
-                scanCache = null;
+                invalidateScan();
                 setState(() => loading = true);
                 _load();
               }),
