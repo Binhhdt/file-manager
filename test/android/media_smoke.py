@@ -43,10 +43,13 @@ def key(name):
     adb("shell", "input", "keyevent", name)
 
 
-def tap(label):
+def tap(label, *, unless=None):
     def bounds():
         adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
         root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
+        if unless and any(unless in (node.get("text", "") + node.get("content-desc", ""))
+                          for node in root.iter("node")):
+            return (0, 0, 0, 0)
         for node in root.iter("node"):
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
             dismiss = text.strip() == "Got it" and node.get("package") == "com.android.systemui"
@@ -62,7 +65,8 @@ def tap(label):
         return None
 
     x1, y1, x2, y2 = wait(f"UI {label}", bounds, seconds=45)
-    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    if x1 < x2:
+        adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
 
 
 def session(track=None, playing=True):
@@ -193,7 +197,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
         foreground()
-        tap("Quay lại")
+        tap("Quay lại", unless="03-fm-video.mp4")
         wait("music while file browser is visible", lambda: session("01-fm-second"))
         tap("03-fm-video.mp4")
         wait("video is playing", lambda: session("03-fm-video"))
