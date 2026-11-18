@@ -67,6 +67,7 @@ def tap(label, *, unless=None):
     x1, y1, x2, y2 = wait(f"UI {label}", bounds, seconds=45)
     if x1 < x2:
         adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+        print(f"Tapped {label}", flush=True)
 
 
 def session(track=None, playing=True):
@@ -95,6 +96,12 @@ def command(action):
         output = adb("shell", "cmd", "media_session", "dispatch", action)
     if any(message in output.lower() for message in ("unknown command", "no shell command", "not found")):
         key(f"KEYCODE_MEDIA_{action.upper()}")
+
+
+def search(query):
+    tap("Tìm kiếm")
+    adb("shell", "input", "text", query)
+    key("KEYCODE_ENTER")
 
 
 def exercise_incoming_call(track):
@@ -163,9 +170,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
         foreground()
-        tap("Tìm kiếm")
-        adb("shell", "input", "text", "fm-")
-        key("KEYCODE_ENTER")
+        search("fm-")
         tap("00-fm-short.mp3")
         wait("auto advance to second track", lambda: session("01-fm-second"))
         print("PASS audio decoding and auto advance", flush=True)
@@ -196,11 +201,16 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         key("KEYCODE_WAKEUP")
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
+        command("stop")
+        wait("foreground audio service stopped", lambda: "isForeground=true" not in
+             adb("shell", "dumpsys", "activity", "services", PACKAGE))
+        # Isolate video UI assertions from Telecom and keyguard focus changes.
+        adb("shell", "am", "force-stop", PACKAGE)
         foreground()
-        tap("Quay lại", unless="03-fm-video.mp4")
-        wait("music while file browser is visible", lambda: session("01-fm-second"))
+        search("03-fm-video")
         tap("03-fm-video.mp4")
         wait("video is playing", lambda: session("03-fm-video"))
+        print("PASS actual MP4 decoding", flush=True)
         command("pause")
         wait("video paused for UI automation", lambda: session("03-fm-video", playing=False))
         tap("Tuỳ chọn phát")
@@ -232,6 +242,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
              adb("shell", "dumpsys", "activity", "services", PACKAGE))
         print("PASS explicit stop releases foreground playback", flush=True)
     except Exception:
+        adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
         print("Latest hierarchy:", adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml", check=False), flush=True)
         print("Package activity:", adb("shell", "dumpsys", "activity", "activities", PACKAGE, check=False), flush=True)
         print(adb("shell", "dumpsys", "media_session", check=False), flush=True)
