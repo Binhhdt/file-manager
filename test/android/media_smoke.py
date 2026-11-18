@@ -36,7 +36,7 @@ def wait(label, predicate, seconds=35):
 
 
 def foreground():
-    adb("shell", "am", "start", "-n", ACTIVITY)
+    adb("shell", "am", "start", "-W", "-n", ACTIVITY)
 
 
 def key(name):
@@ -107,8 +107,13 @@ def exercise_incoming_call(track):
         print("UNVERIFIED simulated call did not expose a pause; emulator audio is muted at the host", flush=True)
     finally:
         adb("emu", "gsm", "cancel", number, check=False)
-        command("play")
-        wait("media can resume after the simulated call", lambda: session(track))
+        # MediaCodec cannot reacquire focus while Telecom still owns it.
+        try:
+            wait("automatic media resume after the simulated call", lambda: session(track), seconds=4)
+        except AssertionError:
+            command("play")
+            wait("media can resume after the simulated call", lambda: session(track), seconds=15)
+        print("PASS media can play again after the simulated call", flush=True)
 
 
 def fixtures(folder):
@@ -182,7 +187,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
         foreground()
-        key("KEYCODE_BACK")
+        tap("Quay lại")
         wait("music while file browser is visible", lambda: session("01-fm-second"))
         tap("03-fm-video.mp4")
         wait("video is playing", lambda: session("03-fm-video"))
@@ -191,7 +196,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         tap("Tuỳ chọn phát")
         tap("Phát âm thanh nền")
         command("play")
-        key("KEYCODE_BACK")
+        tap("Quay lại")
         before = wait("video audio after closing the page", lambda: session("03-fm-video"))
         time.sleep(5)
         after = wait("video audio after elapsed time", lambda: session("03-fm-video"))
