@@ -33,16 +33,17 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          # Android Lint in the generated Gradle project uses Java 21 APIs.
+          java-version: '21'
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
       - name: Tao khung Android
         run: |
-          mkdir -p /tmp/keep && cp -r lib pubspec.yaml /tmp/keep/
+          mkdir -p /tmp/keep && cp -r lib test pubspec.yaml /tmp/keep/
           flutter create --platforms=android --org com.fmdemo --project-name file_manager .
           rm -rf lib test
-          cp -r /tmp/keep/lib . && cp /tmp/keep/pubspec.yaml .
+          cp -r /tmp/keep/lib /tmp/keep/test . && cp /tmp/keep/pubspec.yaml .
           M=android/app/src/main/AndroidManifest.xml
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
@@ -50,6 +51,7 @@ jobs:
       - name: Ma Android goc va icon ung dung
         run: |
           K=$(find android/app/src/main -name MainActivity.kt)
+          cp android_src/StorageBridge.kt "$(dirname "$K")/"
           cat > "$K" <<'EOF'
           package com.fmdemo.file_manager
 
@@ -60,9 +62,8 @@ jobs:
           import android.media.MediaMetadataRetriever
           import android.media.ThumbnailUtils
           import android.os.Build
-          import android.content.Context
+          import android.content.Intent
           import android.os.ParcelFileDescriptor
-          import android.os.storage.StorageManager
           import android.provider.MediaStore
           import android.util.Size
           import android.view.WindowManager
@@ -73,6 +74,20 @@ jobs:
           import java.io.FileOutputStream
 
           class MainActivity : FlutterActivity() {
+              private var storage: StorageBridge? = null
+
+              override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+                  storage?.close()
+                  storage = null
+                  super.cleanUpFlutterEngine(flutterEngine)
+              }
+
+              @Deprecated("Android delivers document tree picker results through this callback")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (storage?.onActivityResult(requestCode, resultCode, data) == true) return
+                  super.onActivityResult(requestCode, resultCode, data)
+              }
+
               private fun saveJpeg(bmp: Bitmap, dest: String) {
                   FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 82, it) }
               }
@@ -144,39 +159,13 @@ jobs:
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
+                  storage = StorageBridge(this, flutterEngine.dartExecutor.binaryMessenger)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
                   if (method == "keepOn") {
                       if (call.argument<String>("src") == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                       else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                       result.success(true)
-                      return@setMethodCallHandler
-                  }
-                  if (method == "volumes") {
-                      val out = ArrayList<Map<String, String>>()
-                      try {
-                          if (Build.VERSION.SDK_INT >= 30) {
-                              val sm = this@MainActivity.getSystemService(Context.STORAGE_SERVICE) as StorageManager
-                              for (v in sm.storageVolumes) {
-                                  if (v.isPrimary) continue
-                                  val d = v.directory ?: continue
-                                  out.add(mapOf("path" to d.absolutePath, "label" to (v.getDescription(this@MainActivity) ?: d.name)))
-                              }
-                          }
-                          if (out.isEmpty()) {
-                              for (f in this@MainActivity.getExternalFilesDirs(null)) {
-                                  if (f == null) continue
-                                  val full = f.absolutePath
-                                  val i = full.indexOf("/Android/")
-                                  if (i <= 0) continue
-                                  val root = full.substring(0, i)
-                                  if (root.startsWith("/storage/emulated")) continue
-                                  out.add(mapOf("path" to root, "label" to File(root).name))
-                              }
-                          }
-                      } catch (e: Throwable) {
-                      }
-                      result.success(out)
                       return@setMethodCallHandler
                   }
                       val src = call.argument<String>("src")
@@ -221,6 +210,11 @@ jobs:
               </group>
           </vector>
           EOF
+      - name: Phan tich va kiem thu
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings lib test
+          flutter test
       - name: Build APK
         run: |
           set -o pipefail
