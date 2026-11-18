@@ -49,10 +49,15 @@ def tap(label):
         root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
         for node in root.iter("node"):
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
-            if label not in text:
+            dismiss = text.strip() == "Got it" and node.get("package") == "com.android.systemui"
+            if label not in text and not dismiss:
                 continue
             points = list(map(int, re.findall(r"\d+", node.get("bounds", ""))))
             if len(points) == 4 and points[0] < points[2] and points[1] < points[3]:
+                if dismiss:
+                    adb("shell", "input", "tap", str((points[0] + points[2]) // 2),
+                        str((points[1] + points[3]) // 2))
+                    return None
                 return points
         return None
 
@@ -107,7 +112,7 @@ def exercise_incoming_call(track):
         print("UNVERIFIED simulated call did not expose a pause; emulator audio is muted at the host", flush=True)
     finally:
         adb("emu", "gsm", "cancel", number, check=False)
-        # MediaCodec cannot reacquire focus while Telecom still owns it.
+        # Playback cannot reacquire Audio Focus while Telecom still owns it.
         try:
             wait("automatic media resume after the simulated call", lambda: session(track), seconds=4)
         except AssertionError:
@@ -147,6 +152,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
             adb("push", str(file), f"/sdcard/Download/{file.name}")
         for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
             adb("shell", "settings", "put", "global", setting, "0")
+        adb("shell", "settings", "put", "secure", "immersive_mode_confirmations", "confirmed")
         adb("shell", "wm", "size", "720x1600")
         adb("shell", "wm", "density", "240")
         key("KEYCODE_WAKEUP")
