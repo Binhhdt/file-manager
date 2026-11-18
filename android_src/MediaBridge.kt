@@ -37,6 +37,8 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
     private var inPip = false
     private var fullscreen = false
     private var keepAwake = false
+    private var clockScheduled = false
+    private var lastSnapshot: Map<String, Any?>? = null
     private var page: Int? = null
     private var texture: TextureView? = null
     private var pendingLaunch = activity.intent?.action == MediaPlaybackService.OPEN_PLAYER
@@ -45,10 +47,8 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
 
     private val ticker = object : Runnable {
         override fun run() {
-            if (resumed && page != null && sink != null) {
-                broadcast()
-                main.postDelayed(this, 400)
-            }
+            clockScheduled = false
+            broadcast()
         }
     }
 
@@ -77,6 +77,7 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
         events.setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, eventSink: EventChannel.EventSink) {
                 sink = eventSink
+                lastSnapshot = null
                 bind()
                 broadcast()
                 publishLaunch()
@@ -84,7 +85,7 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
 
             override fun onCancel(arguments: Any?) {
                 sink = null
-                main.removeCallbacks(ticker)
+                syncClock(false)
             }
         })
         commands.setMethodCallHandler { call, reply ->
@@ -219,8 +220,6 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
 
     private fun updatePresentation() {
         playback?.setPresentation(resumed, page != null, inPip)
-        main.removeCallbacks(ticker)
-        if (resumed && page != null && sink != null) main.postDelayed(ticker, 400L)
         broadcast()
     }
 
@@ -232,7 +231,20 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
             if (bright) activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
-        sink?.success(snapshot + mapOf("supportsPip" to supportsPip()))
+        val eventSink = sink
+        syncClock(eventSink != null && snapshot["playing"] == true && resumed && page != null && !inPip)
+        val next = snapshot + mapOf("supportsPip" to supportsPip())
+        if (eventSink != null && lastSnapshot != next) {
+            lastSnapshot = next
+            eventSink.success(next)
+        }
+    }
+
+    private fun syncClock(running: Boolean) {
+        if (running == clockScheduled) return
+        clockScheduled = running
+        if (running) main.postDelayed(ticker, 400L)
+        else main.removeCallbacks(ticker)
     }
 
     private fun setFullscreen(value: Boolean) {
@@ -272,6 +284,7 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
 
     fun close() {
         main.removeCallbacksAndMessages(null)
+        clockScheduled = false
         commands.setMethodCallHandler(null)
         events.setStreamHandler(null)
         sink = null

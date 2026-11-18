@@ -43,13 +43,13 @@ def key(name):
     adb("shell", "input", "keyevent", name)
 
 
-def tap(label, *, unless=None):
+def tap(label):
     def bounds():
-        adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
+        adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
+        result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
+        if "dumped to" not in result:
+            return None
         root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
-        if unless and any(unless in (node.get("text", "") + node.get("content-desc", ""))
-                          for node in root.iter("node")):
-            return (0, 0, 0, 0)
         for node in root.iter("node"):
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
             dismiss = text.strip() == "Got it" and node.get("package") == "com.android.systemui"
@@ -65,9 +65,8 @@ def tap(label, *, unless=None):
         return None
 
     x1, y1, x2, y2 = wait(f"UI {label}", bounds, seconds=45)
-    if x1 < x2:
-        adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
-        print(f"Tapped {label}", flush=True)
+    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    print(f"Tapped {label}", flush=True)
 
 
 def session(track=None, playing=True):
@@ -215,8 +214,8 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         wait("video paused for UI automation", lambda: session("03-fm-video", playing=False))
         tap("Tuỳ chọn phát")
         tap("Phát âm thanh nền")
-        command("play")
         tap("Quay lại")
+        command("play")
         before = wait("video audio after closing the page", lambda: session("03-fm-video"))
         time.sleep(5)
         after = wait("video audio after elapsed time", lambda: session("03-fm-video"))
