@@ -79,7 +79,35 @@ def session(track=None, playing=True):
 
 
 def command(action):
-    adb("shell", "cmd", "media_session", "dispatch", action)
+    if version < 26:
+        output = adb("shell", "media", "dispatch", action)
+    else:
+        output = adb("shell", "cmd", "media_session", "dispatch", action)
+    if any(message in output.lower() for message in ("unknown command", "no shell command", "not found")):
+        key(f"KEYCODE_MEDIA_{action.upper()}")
+
+
+def exercise_incoming_call(track):
+    # The emulator console injects a local, simulated call.
+    number = "5550102"
+    if "OK" not in adb("emu", "gsm", "call", number, check=False):
+        print("UNVERIFIED simulated incoming call unavailable on this image", flush=True)
+        return
+    try:
+        def ringing_or_active():
+            calls = adb("emu", "gsm", "list", check=False)
+            return number in calls and re.search(r"ringing|incoming|active", calls, re.I)
+
+        wait("simulated incoming call", ringing_or_active, seconds=8)
+        adb("emu", "gsm", "accept", number, check=False)
+        wait("Android pauses media for the simulated call", lambda: session(track, playing=False), seconds=12)
+        print("PASS playback paused while a simulated call was active", flush=True)
+    except AssertionError:
+        print("UNVERIFIED simulated call did not expose a pause; emulator audio is muted at the host", flush=True)
+    finally:
+        adb("emu", "gsm", "cancel", number, check=False)
+        command("play")
+        wait("media can resume after the simulated call", lambda: session(track))
 
 
 def fixtures(folder):
@@ -143,8 +171,10 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         command("previous")
         wait("system media previous", lambda: session("01-fm-second"))
         print("PASS Android media session play/pause/next/previous commands", flush=True)
+        exercise_incoming_call("01-fm-second")
 
         key("KEYCODE_WAKEUP")
+        adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
         foreground()
         key("KEYCODE_BACK")
