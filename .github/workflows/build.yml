@@ -57,6 +57,7 @@ jobs:
 
           import android.graphics.Bitmap
           import android.graphics.Canvas
+          import android.graphics.ImageDecoder
           import android.graphics.Color
           import android.graphics.pdf.PdfRenderer
           import android.media.MediaMetadataRetriever
@@ -105,6 +106,29 @@ jobs:
                           FileOutputStream(File(dest)).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                           return true
                       }
+                      "imageThumb" -> {
+                          if (Build.VERSION.SDK_INT < 28) return false
+                          val source = ImageDecoder.createSource(File(src))
+                          val bmp = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                              decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                              val w = info.size.width
+                              val h = info.size.height
+                              val max = maxOf(w, h)
+                              if (max > 384) decoder.setTargetSize(
+                                  (w.toLong() * 384 / max).toInt().coerceAtLeast(1),
+                                  (h.toLong() * 384 / max).toInt().coerceAtLeast(1)
+                              )
+                          }
+                          try {
+                              return FileOutputStream(File(dest)).use {
+                                  bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+                              }
+                          } finally {
+                              bmp.recycle()
+                          }
+                      }
+                      "documentThumb", "documentDuration" ->
+                          return storage?.preview(method, src, dest) ?: false
                       "videoThumb" -> {
                           @Suppress("DEPRECATION")
                           val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29)
@@ -170,7 +194,7 @@ jobs:
                   }
                       val src = call.argument<String>("src")
                       val dest = call.argument<String>("dest")
-                      val known = setOf("apkIcon", "videoThumb", "pdfThumb", "audioArt", "duration")
+                      val known = setOf("apkIcon", "imageThumb", "videoThumb", "pdfThumb", "audioArt", "duration", "documentThumb", "documentDuration")
                       if (src == null || dest == null || !known.contains(method)) {
                           result.notImplemented()
                       } else {
@@ -178,7 +202,7 @@ jobs:
                               val res: Any = try {
                                   work(method, src, dest)
                               } catch (e: Throwable) {
-                                  if (method == "duration") 0L else false
+                                  if (method == "duration" || method == "documentDuration") 0L else false
                               }
                               runOnUiThread { result.success(res) }
                           }.start()

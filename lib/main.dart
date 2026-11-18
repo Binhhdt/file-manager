@@ -14,9 +14,11 @@ import 'package:share_plus/share_plus.dart' as sp;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+import 'file_catalog.dart';
 import 'file_operations.dart';
 import 'storage.dart';
 import 'trash.dart';
+import 'thumbnail_cache.dart';
 
 const rootPath = '/storage/emulated/0';
 
@@ -30,6 +32,7 @@ final storage = Storage();
 late FileOperations operations;
 late Trash trash;
 final volumeChanges = ValueNotifier<int>(0);
+final storageVolumeEvents = ValueNotifier<int>(0);
 
 class Cat {
   final String name;
@@ -52,7 +55,9 @@ class Item {
   final StorageEntry e;
   Item(this.e);
   bool get isDir => e.isDir;
-  String get name => p.basename(e.path);
+  late final String name = p.basename(e.path);
+  late final String sortName = name.toLowerCase();
+  late final String extension = extOf(e.path);
 }
 
 class FmClip {
@@ -159,68 +164,38 @@ Future<int> sizeOf(String path) async {
   }
 }
 
-final _scanCache = <bool, Future<List<StorageEntry>>>{};
-DateTime scanAt = DateTime(2000);
+FileCatalog catalog = FileCatalog(storage, rootPath);
+ThumbnailCache thumbnails = ThumbnailCache(Directory(p.join(Directory.systemTemp.path, 'fm-previews')), _generateThumbnail);
+bool indexInternal = !Platform.isAndroid;
+List<CatalogRoot> volumeRoots = const [];
+final _searchNames = Expando<String>();
 
-void invalidateScan() => _scanCache.clear();
-
-String sigOf(Iterable<String> paths) {
-  var hash = 0, count = 0;
-  for (final path in paths) {
-    hash ^= path.hashCode;
-    count++;
-  }
-  return '$count:$hash';
-}
+List<CatalogRoot> _roots(bool removable) => [
+  if (indexInternal) const CatalogRoot(rootPath),
+  if (removable) ...volumeRoots,
+];
 
 Future<List<StorageEntry>> scan({bool dirs = false, bool removable = false}) async {
-  if (DateTime.now().difference(scanAt).inSeconds > 30) {
-    invalidateScan();
-    scanAt = DateTime.now();
-  }
-  final entries = await _scanCache.putIfAbsent(removable, () async {
-    final out = <StorageEntry>[];
-    Future<void> walk(String dir, {String? physicalRoot, Set<String>? seen}) async {
-      try {
-        await for (final entry in storage.children(dir)) {
-          final name = p.basename(entry.path);
-          if (name.startsWith('.')) continue;
-          final physical = physicalRoot == null ? null : p.join(physicalRoot, name);
-          final fresh = physical == null || seen!.add(physical);
-          if (entry.isDir) {
-            if (entry.path == '$rootPath/Android') continue;
-            if (fresh) out.add(entry);
-            await walk(entry.path, physicalRoot: physical, seen: seen);
-          } else if (entry.isFile && fresh) {
-            out.add(entry);
-          }
-        }
-      } catch (_) {
-        // Continue with the next readable directory or volume.
-      }
-    }
+  final roots = _roots(removable);
+  await catalog.refreshTree(roots);
+  return catalog.cachedTree(roots, dirs: dirs) ?? [];
+}
 
-    await walk(rootPath);
-    if (removable) {
-      try {
-        final seen = <String>{};
-        for (final volume in await storage.volumes()) {
-          final path = volume.path;
-          if (path == null) continue;
-          try {
-            final real = await storage.identity(path);
-            await walk(path, physicalRoot: real, seen: seen);
-          } catch (_) {
-            // A volume can disappear while the remaining volumes are scanned.
-          }
-        }
-      } catch (_) {
-        // Internal results remain available during a volume change.
-      }
-    }
-    return out;
-  });
-  return dirs ? List.of(entries) : entries.where((entry) => entry.isFile).toList();
+bool _sameEntries(List<StorageEntry>? a, List<StorageEntry> b) {
+  if (a == null || a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (!identical(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+class _CatalogLifecycle with WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed || state == AppLifecycleState.inactive;
+    catalog.setForeground(active);
+    thumbnails.setForeground(active);
+  }
 }
 
 const textExts = {'txt', 'md', 'json', 'csv', 'log', 'xml', 'html', 'htm', 'js', 'css', 'dart', 'py', 'java', 'kt', 'yaml', 'yml', 'ini', 'cfg', 'lrc', 'srt'};
@@ -397,21 +372,18 @@ Future<bool> confirm(BuildContext context, String title, String msg, String ok) 
 }
 
 Widget fileIcon(Item it, {double size = 42}) {
+  final entry = it.e;
   if (it.isDir) return Icon(Icons.folder, size: size, color: blue);
-  final c = catOf(it.e.path);
-  if (isSaf(it.e.path)) return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
-  if (c != null && c.name == 'Hình') {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: Image.file(File(it.e.path),
-          width: size, height: size, fit: BoxFit.cover, cacheWidth: 160,
-          errorBuilder: (_, __, ___) => Icon(c.icon, size: size, color: c.color)),
-    );
+  final c = catOf(entry.path);
+  if (c?.name == 'Hình') {
+    return ClipRRect(borderRadius: BorderRadius.circular(8), child: _preview(entry, size, 'image'));
   }
-  if (c != null && c.name == 'Video') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size);
-  if (c != null && c.name == 'APP') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'apk');
-  if (c != null && c.name == 'Âm thanh') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'audio');
-  if (extOf(it.e.path) == 'pdf') return VideoThumb(key: ValueKey(it.e.path), path: it.e.path, size: size, kind: 'pdf');
+  if (c?.name == 'Video') return _preview(entry, size, 'video');
+  if (!isSaf(entry.path)) {
+    if (c?.name == 'APP') return _preview(entry, size, 'apk');
+    if (c?.name == 'Âm thanh') return _preview(entry, size, 'audio');
+    if (extOf(entry.path) == 'pdf') return _preview(entry, size, 'pdf');
+  }
   return Icon(c?.icon ?? Icons.insert_drive_file, size: size, color: c?.color ?? Colors.grey);
 }
 
@@ -429,14 +401,66 @@ Widget tickMark(bool on) => Container(
     );
 
 /// Anh vuong lap day o, dung cho luoi hinh va video.
-Widget mediaThumb(String path, double s) {
-  final c = catOf(path);
-  if (isSaf(path)) return SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.insert_drive_file, color: c?.color));
-  if (c?.name == 'Video') return VideoThumb(key: ValueKey(path), path: path, size: s, square: true);
-  return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(c?.icon ?? Icons.image, size: s * 0.5, color: c?.color ?? Colors.grey)));
+Widget mediaThumb(StorageEntry entry, double s, {bool square = true}) =>
+    _preview(entry, s, catOf(entry.path)?.name == 'Video' ? 'video' : 'image', square: square);
+
+Widget _preview(StorageEntry entry, double size, String kind, {bool square = false}) {
+  final key = ValueKey((entry.path, entry.size, entry.modified, entry.version, entry.identity, kind));
+  if (kind == 'image' && !isSaf(entry.path) && const {'gif', 'webp'}.contains(extOf(entry.path))) {
+    return Image.file(
+      File(entry.path), key: key, width: size, height: size, fit: BoxFit.cover,
+      cacheWidth: size <= 160 ? 160 : previewSize,
+      errorBuilder: (_, __, ___) => Icon(Icons.image, size: size * 0.5, color: const Color(0xFFF09A45)),
+    );
+  }
+  return VideoThumb(key: key, entry: entry, size: size, kind: kind, square: square);
 }
 
-final durCache = <String, int>{};
+Future<ThumbnailPreview> _generateThumbnail(StorageEntry entry, String kind, File output) async {
+  final path = entry.path;
+  final args = {'src': path, 'dest': output.path};
+  final document = isSaf(path);
+  String? thumbnail;
+  final method = document ? 'documentThumb' : const {
+    'image': 'imageThumb', 'video': 'videoThumb', 'apk': 'apkIcon',
+    'audio': 'audioArt', 'pdf': 'pdfThumb',
+  }[kind]!;
+  try {
+    if (await nativeCh.invokeMethod<bool>(method, args) == true) thumbnail = output.path;
+  } catch (_) {
+    // Unsupported platform formats keep the existing fallback.
+  }
+  if (thumbnail == null && !document && kind == 'image') {
+    try {
+      await writeImagePreview(path, output);
+      if (await output.exists()) thumbnail = output.path;
+    } catch (_) {}
+  }
+  if (thumbnail == null && !document && kind == 'video') {
+    final dynamic plugin = FcNativeVideoThumbnail();
+    final attempts = <dynamic Function()>[
+      () => plugin.saveThumbnailToFile(srcFile: path, destFile: output.path, width: 256, height: 256, quality: 80),
+      () => plugin.saveThumbnailToFile(srcFile: path, destFile: output.path, width: 256, height: 256, format: 'jpeg', quality: 80),
+      () => plugin.getVideoThumbnail(srcFile: path, destFile: output.path, width: 256, height: 256, format: 'jpeg', quality: 80),
+    ];
+    for (final attempt in attempts) {
+      try {
+        final result = await attempt();
+        if (result == true || await output.exists()) {
+          thumbnail = output.path;
+          break;
+        }
+      } catch (_) {}
+    }
+  }
+  var duration = 0;
+  if (kind == 'video' || kind == 'audio') {
+    try {
+      duration = await nativeCh.invokeMethod<int>(document ? 'documentDuration' : 'duration', args) ?? 0;
+    } catch (_) {}
+  }
+  return ThumbnailPreview(thumbnail, duration);
+}
 
 String fmtDur(int ms) {
   final d = Duration(milliseconds: ms);
@@ -446,73 +470,28 @@ String fmtDur(int ms) {
 
 /// Anh thu nho tao bang ma Android goc: khung hinh video, bia nhac, trang dau PDF, icon APK.
 class VideoThumb extends StatefulWidget {
-  final String path;
+  final StorageEntry entry;
   final double size;
-  final String kind; // video | audio | pdf | apk
+  final String kind;
   final bool square;
-  const VideoThumb({super.key, required this.path, required this.size, this.kind = 'video', this.square = false});
+  const VideoThumb({super.key, required this.entry, required this.size, required this.kind, this.square = false});
   @override
   State<VideoThumb> createState() => _VideoThumbState();
 }
 
 class _VideoThumbState extends State<VideoThumb> {
-  late final Future<String?> future = _make();
-  int dur = 0;
+  late final ThumbnailRequest _request;
 
-  bool get timed => widget.kind == 'video' || widget.kind == 'audio';
-
-  Future<void> _loadDur() async {
-    var d = durCache[widget.path];
-    if (d == null) {
-      try {
-        d = await nativeCh.invokeMethod<int>('duration', {'src': widget.path, 'dest': ''}) ?? 0;
-      } catch (_) {
-        d = 0;
-      }
-    }
-    final int v = d ?? 0;
-    durCache[widget.path] = v;
-    if (mounted && v > 0) setState(() => dur = v);
+  @override
+  void initState() {
+    super.initState();
+    _request = thumbnails.request(widget.entry, widget.kind);
   }
 
-  Future<String?> _make() async {
-    final src = widget.path;
-    final kind = widget.kind;
-    if (timed) _loadDur();
-    try {
-      final dir = Directory('${Directory.systemTemp.path}/thumbs');
-      await dir.create(recursive: true);
-      final st = await File(src).stat();
-      final dest = '${dir.path}/${kind}_${src.hashCode}_${st.size}.${kind == 'apk' ? 'png' : 'jpg'}';
-      if (await File(dest).exists()) return dest;
-      final none = File('$dest.none');
-      if (await none.exists()) return null;
-      final method = const {'apk': 'apkIcon', 'video': 'videoThumb', 'pdf': 'pdfThumb', 'audio': 'audioArt'}[kind] ?? 'videoThumb';
-      try {
-        final ok = await nativeCh.invokeMethod<bool>(method, {'src': src, 'dest': dest});
-        if (ok == true) return dest;
-      } catch (_) {}
-      if (kind == 'video') {
-        final dynamic pl = FcNativeVideoThumbnail();
-        final tries = <dynamic Function()>[
-          () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, quality: 80),
-          () => pl.saveThumbnailToFile(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
-          () => pl.getVideoThumbnail(srcFile: src, destFile: dest, width: 256, height: 256, format: 'jpeg', quality: 80),
-        ];
-        for (final t in tries) {
-          try {
-            final r = await t();
-            if (r == true || await File(dest).exists()) return dest;
-          } catch (_) {}
-        }
-      }
-      try {
-        await none.create();
-      } catch (_) {}
-      return null;
-    } catch (_) {
-      return null;
-    }
+  @override
+  void dispose() {
+    _request.cancel();
+    super.dispose();
   }
 
   @override
@@ -520,18 +499,30 @@ class _VideoThumbState extends State<VideoThumb> {
     final s = widget.size;
     final k = widget.kind;
     Widget fallback() {
+      if (k == 'image') {
+        final cat = catOf(widget.entry.path);
+        return Icon(cat?.icon ?? Icons.image, size: widget.square ? s * 0.5 : s, color: cat?.color ?? Colors.grey);
+      }
+      if (isSaf(widget.entry.path)) return Icon(catOf(widget.entry.path)?.icon ?? Icons.insert_drive_file, color: catOf(widget.entry.path)?.color);
       if (k == 'apk') return Icon(Icons.android, size: s, color: const Color(0xFF4CAE6C));
       if (k == 'pdf') return Icon(Icons.picture_as_pdf, size: s, color: const Color(0xFFE5532D));
       if (k == 'audio') return Container(width: s, height: s, color: const Color(0xFFD9D9D9), child: Icon(Icons.album, size: s * 0.75, color: const Color(0xFFBDBDBD)));
       return Container(width: s, height: s, color: const Color(0xFF3FBFB4), child: Icon(Icons.movie, size: s * 0.55, color: Colors.white));
     }
 
-    return FutureBuilder<String?>(
-      future: future,
+    return FutureBuilder<ThumbnailPreview>(
+      future: _request.result,
       builder: (_, snap) {
-        final has = snap.data != null;
-        final Widget base = has ? Image.file(File(snap.data!), width: s, height: s, fit: (k == 'apk' || k == 'pdf') ? BoxFit.contain : BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => fallback()) : fallback();
+        final path = snap.data?.path;
+        final has = path != null;
+        final dur = snap.data?.duration ?? 0;
+        final Widget base = has ? Image.file(
+          File(path), width: s, height: s, fit: (k == 'apk' || k == 'pdf') ? BoxFit.contain : BoxFit.cover,
+          cacheWidth: k == 'image' ? (s <= 160 ? 160 : previewSize) : 300,
+          errorBuilder: (_, __, ___) => fallback(),
+        ) : fallback();
         if (k == 'apk') return base;
+        if (k == 'image') return SizedBox(width: s, height: s, child: base);
         if (k == 'pdf') {
           return SizedBox(
             width: s,
@@ -660,6 +651,10 @@ Future<void> main() async {
   final privatePath = Platform.isAndroid
       ? (await storageChannel.invokeMethod<String>('privateDir'))!
       : Directory.systemTemp.path;
+  catalog = FileCatalog(storage, rootPath, directory: Directory(p.join(privatePath, 'fm-catalog')));
+  thumbnails = ThumbnailCache(Directory(p.join(privatePath, 'fm-previews')), _generateThumbnail);
+  WidgetsBinding.instance.addObserver(_CatalogLifecycle());
+  unawaited(catalog.ready);
   operations = FileOperations(storage, Directory(p.join(privatePath, 'fm-transactions')));
   trash = Trash(operations, Directory(p.join(privatePath, 'fm-trash')), trashDir, rootPath, getTrash, (path) async {
     final old = getTrash()..remove(path);
@@ -669,8 +664,10 @@ Future<void> main() async {
   });
   storageChannel.setMethodCallHandler((call) async {
     if (call.method == 'changed') {
-      invalidateScan();
+      volumeRoots = const [];
+      catalog.recheckTree();
       volumeChanges.value++;
+      storageVolumeEvents.value++;
     }
   });
   unawaited(_cleanOpenedDocuments());
@@ -725,13 +722,14 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    volumeChanges.addListener(_volumesChanged);
+    storageVolumeEvents.addListener(_volumesChanged);
     _init();
   }
 
   Future<void> _init() async {
     final g = await ensurePerm();
     if (g) await _df();
+    indexInternal = g;
     if (mounted) setState(() => granted = g);
     await _refreshVolumes();
     await _recover();
@@ -746,7 +744,7 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    volumeChanges.removeListener(_volumesChanged);
+    storageVolumeEvents.removeListener(_volumesChanged);
     super.dispose();
   }
 
@@ -769,10 +767,27 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  int _volumeRequest = 0;
+
   Future<void> _refreshVolumes() async {
+    final request = ++_volumeRequest;
     try {
       final found = await storage.volumes();
-      if (mounted) setState(() => vols = found);
+      final roots = <CatalogRoot>[];
+      for (final volume in found) {
+        final path = volume.path;
+        if (path == null) continue;
+        try {
+          roots.add(CatalogRoot(path, await storage.identity(path)));
+        } catch (_) {
+          // The mount can be removed before identity lookup completes.
+        }
+      }
+      final before = volumeRoots.map((root) => root.path).join('\n');
+      if (!mounted || request != _volumeRequest) return;
+      volumeRoots = roots;
+      setState(() => vols = found);
+      if (before != roots.map((root) => root.path).join('\n')) volumeChanges.value++;
     } catch (error) {
       if (mounted) _message('Không đọc được danh sách SD/USB: ${storageError(error)}');
     }
@@ -990,11 +1005,14 @@ class BrowserPage extends StatefulWidget {
 
 class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   Timer? _poll;
-  String _lastSig = '';
-  bool _checking = false;
+  Timer? _catalogDebounce;
+  StreamSubscription<String>? _catalogSubscription;
+  Object? _displayed;
+  List<StorageEntry>? _displayedEntries;
 
   late String cur = widget.path;
   List<Item> items = [];
+  Map<String, int> _positions = {};
   bool loading = true;
   final sel = <String>{};
   String q = '';
@@ -1014,13 +1032,17 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     volumeChanges.addListener(_volumeChanged);
     _load();
-    // Tu kiem tra thu muc dang mo moi 3 giay de hien tap tin moi.
-    if (isDir) _poll = Timer.periodic(const Duration(seconds: 3), (_) => _check());
+    if (!isTrash) {
+      _catalogSubscription = catalog.changes.listen(_catalogChanged);
+      _poll = Timer.periodic(Duration(seconds: isDir ? 3 : 20), (_) => _pollVisible());
+    }
   }
 
   @override
   void dispose() {
     _poll?.cancel();
+    _catalogDebounce?.cancel();
+    unawaited(_catalogSubscription?.cancel());
     _deb?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     volumeChanges.removeListener(_volumeChanged);
@@ -1029,36 +1051,26 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && mounted && !loading) {
-      invalidateScan();
-      _load(silent: true);
+    if (state == AppLifecycleState.resumed && mounted && _isCurrent) {
+      unawaited(_load(silent: true, audit: isDir));
     }
   }
+
+  bool get _isCurrent => ModalRoute.of(context)?.isCurrent ?? true;
 
   void _volumeChanged() {
-    if (!mounted) return;
-    if (!isDir || !inDirectory(rootPath, cur)) unawaited(_load(silent: true));
+    if (mounted && (!isDir || !inDirectory(rootPath, cur))) unawaited(_load(silent: true));
   }
 
-  Future<void> _check() async {
-    if (!mounted || loading || _checking) return;
-    if (!(ModalRoute.of(context)?.isCurrent ?? true)) return;
-    _checking = true;
-    try {
-      final at = cur;
-      await storage.available(at);
-      final paths = isSaf(at)
-          ? await storage.children(at).map((entry) => entry.path).toList()
-          : await Directory(at).list(followLinks: false).map((entry) => entry.path).toList();
-      if (mounted && !loading && at == cur &&
-          (_directoryUnavailable || sigOf(paths.where(_visible)) != _lastSig)) {
-        await _load(silent: true);
-      }
-    } catch (_) {
-      if (mounted && !_directoryUnavailable) await _load(silent: true);
-    } finally {
-      _checking = false;
-    }
+  void _catalogChanged(String folder) {
+    if (isDir && folder != cur) return;
+    if (widget.only != null && folder != widget.only) return;
+    _catalogDebounce?.cancel();
+    _catalogDebounce = Timer(const Duration(milliseconds: 160), _pollVisible);
+  }
+
+  void _pollVisible() {
+    if (mounted && catalog.foreground && _isCurrent) unawaited(_load(silent: true));
   }
 
   void _msg(String m) {
@@ -1075,59 +1087,92 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     return !privateStorageName(name) && (hidden || !name.startsWith('.'));
   }
 
-  Future<List<StorageEntry>> _visibleChildren(String path) async {
-    await storage.available(path);
-    return storage.children(path).where((entry) => _visible(entry.path)).toList();
-  }
-
-  Future<void> _load({bool silent = false}) async {
-    if (!silent) setState(() => loading = true);
+  Future<void> _load({bool silent = false, bool force = false, bool audit = false}) async {
     final gen = ++_gen;
-    var entries = <StorageEntry>[];
-    var unavailable = false;
+    final path = cur;
+    final term = noAccent(q.trim());
+    final key = (path, q, sort, hidden);
+    final only = widget.only;
+    final folder = isDir ? path : only;
+    final roots = _roots(widget.mode != Mode.recent);
+    bool valid() => mounted && gen == _gen && key == (cur, q, sort, hidden);
+
+    List<StorageEntry> filter(List<StorageEntry> entries) => switch (widget.mode) {
+      Mode.dir => entries.where((entry) => _visible(entry.path)).toList(),
+      Mode.cat => entries.where((entry) => entry.isFile &&
+          !p.basename(entry.path).startsWith('.') && widget.cat!.exts.contains(extOf(entry.path))).toList(),
+      Mode.search => entries.where((entry) => (_searchNames[entry] ??= noAccent(p.basename(entry.path))).contains(term)).toList(),
+      _ => entries,
+    };
+
+    void show(List<StorageEntry> entries, {bool unavailable = false}) {
+      if (!valid()) return;
+      final sameView = _displayed == key;
+      if (sameView && !loading && _directoryUnavailable == unavailable &&
+          _sameEntries(_displayedEntries, entries) && (silent || sel.isEmpty)) return;
+      var out = entries.map(Item.new).toList();
+      if (widget.mode == Mode.recent) {
+        out.sort((a, b) => b.e.modified.compareTo(a.e.modified));
+        out = out.take(50).toList();
+      } else {
+        _sort(out);
+      }
+      setState(() {
+        _displayed = key;
+        _displayedEntries = entries;
+        _directoryUnavailable = unavailable;
+        items = out;
+        _positions = {for (var i = 0; i < out.length; i++) out[i].e.path: i};
+        loading = false;
+        if (sameView && silent) {
+          final have = out.map((item) => item.e.path).toSet();
+          sel.removeWhere((path) => !have.contains(path));
+        } else {
+          sel.clear();
+        }
+      });
+    }
+
     try {
-      switch (widget.mode) {
-        case Mode.dir:
-          entries = await _visibleChildren(cur);
-        case Mode.cat:
-          entries = (await scan(removable: true)).where((e) => widget.cat!.exts.contains(extOf(e.path)) && (widget.only == null || p.dirname(e.path) == widget.only)).toList();
-        case Mode.recent:
-          entries = await scan();
-        case Mode.search:
-          final term = noAccent(q.trim());
-          entries = term.isEmpty ? [] : (await scan(dirs: true, removable: true)).where((e) => noAccent(p.basename(e.path)).contains(term)).toList();
-        case Mode.trash:
-          entries = await trash.list();
+      if (widget.mode == Mode.search && term.isEmpty) {
+        show(const []);
+        return;
+      }
+      if (isTrash) {
+        if (valid() && _displayed == null && !loading) setState(() => loading = true);
+        show(await trash.list());
+        return;
+      }
+      await catalog.ready;
+      if (!valid()) return;
+      if (folder != null && !inDirectory(rootPath, folder)) await storage.available(folder);
+      if (!valid()) return;
+      final cached = folder == null
+          ? catalog.cachedTree(roots, dirs: widget.mode == Mode.search)
+          : catalog.cached(folder);
+      if (cached != null) {
+        show(filter(cached));
+      } else if (_displayed != key && !loading) {
+        setState(() {
+          loading = true;
+          sel.clear();
+        });
+      }
+      if (folder != null) {
+        show(filter(await catalog.refresh(folder, priority: true, force: force, audit: audit)));
+      } else {
+        await catalog.refreshTree(roots, force: force);
+        show(filter(catalog.cachedTree(roots, dirs: widget.mode == Mode.search) ?? []));
       }
     } catch (error) {
-      unavailable = isDir;
-      if (gen == _gen && (!_directoryUnavailable || !silent)) _msg('Không đọc được thư mục: ${storageError(error)}');
+      if (!valid()) return;
+      if (!_directoryUnavailable || !silent) _msg('Không đọc được thư mục: ${storageError(error)}');
+      show(const [], unavailable: isDir);
     }
-    var out = entries.map(Item.new).toList();
-    if (widget.mode == Mode.recent) {
-      out.sort((a, b) => b.e.modified.compareTo(a.e.modified));
-      out = out.take(50).toList();
-    } else {
-      _sort(out);
-    }
-    if (!mounted) return;
-    if (gen != _gen) return;
-    setState(() {
-      _directoryUnavailable = unavailable;
-      if (isDir) _lastSig = sigOf(entries.map((entry) => entry.path));
-      items = out;
-      loading = false;
-      if (silent) {
-        final have = out.map((i) => i.e.path).toSet();
-        sel.removeWhere((x) => !have.contains(x));
-      } else {
-        sel.clear();
-      }
-    });
   }
 
   void _sort(List<Item> l) {
-    int byName(Item a, Item b) => a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    int byName(Item a, Item b) => a.sortName.compareTo(b.sortName);
     int c(Item a, Item b) {
       switch (sort) {
         case 'date':
@@ -1135,7 +1180,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
         case 'size':
           return b.e.size.compareTo(a.e.size);
         case 'type':
-          final r = extOf(a.e.path).compareTo(extOf(b.e.path));
+          final r = a.extension.compareTo(b.extension);
           return r != 0 ? r : byName(a, b);
         default:
           return byName(a, b);
@@ -1155,7 +1200,6 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     } catch (e) {
       _msg('Lỗi: ${storageError(e)}');
     }
-    invalidateScan();
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1176,7 +1220,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     if (_badName(s)) return;
     await _run(() => operations.exclusive(() async {
       await storage.available(cur);
-      await storage.createDirectory(await storage.unique(cur, s!));
+      final path = await storage.unique(cur, s!);
+      await storage.createDirectory(path);
+      catalog.markPath(path);
     }), 'Đã tạo thư mục');
   }
 
@@ -1185,8 +1231,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     if (_badName(s)) return;
     await _run(() => operations.exclusive(() async {
       await storage.available(cur);
-      final stream = await storage.open(await storage.unique(cur, s!), write: true);
+      final path = await storage.unique(cur, s!);
+      final stream = await storage.open(path, write: true);
       await stream.close();
+      catalog.markPath(path);
     }), 'Đã tạo tập tin');
   }
 
@@ -1194,7 +1242,11 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     final s = await prompt(context, 'Đổi tên', p.basename(path));
     if (_badName(s) || s == p.basename(path)) return;
     final dest = p.join(p.dirname(path), s!);
-    await _run(() async { await operations.move(path, dest, fast: true); }, 'Đã đổi tên');
+    await _run(() async {
+      await operations.move(path, dest, fast: true);
+      catalog.markPath(path);
+      catalog.markPath(dest);
+    }, 'Đã đổi tên');
   }
 
   Future<void> _trashBatch(
@@ -1230,7 +1282,8 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     } else {
       _msg(job.cancelled ? '$result. Đã huỷ phần còn lại' : result);
     }
-    invalidateScan();
+    catalog.markPaths(paths);
+    if (isTrash) catalog.recheckTree();
     if (mounted) await _load();
   }
 
@@ -1311,7 +1364,9 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       }
     });
     _msg(result);
-    invalidateScan();
+    catalog.markDirectory(directory);
+    catalog.markSubtrees({for (final source in c.paths) p.join(directory, p.basename(source))});
+    if (c.cut) catalog.markPaths(c.paths);
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1335,7 +1390,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       }
     }, cancellable: false);
     _msg(result);
-    invalidateScan();
+    catalog.markPath(out);
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1368,7 +1423,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       }
     }, cancellable: false);
     _msg(result);
-    invalidateScan();
+    catalog.markPath(dest);
     if (mounted) {
       sel.clear();
       await _load(silent: true);
@@ -1414,7 +1469,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     final c = catOf(path);
     final sib = c == null ? null : items.where((i) => !i.isDir && catOf(i.e.path) == c).map((i) => i.e.path).toList();
     await openFile(context, path, siblings: sib);
-    if (mounted && textExts.contains(extOf(path))) _load(silent: true);
+    if (mounted && textExts.contains(extOf(path))) {
+      catalog.markPath(path);
+      _load(silent: true);
+    }
   }
 
   void _sheet(Item it) {
@@ -1544,17 +1602,20 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       body = Center(child: Text(t, style: const TextStyle(color: Colors.grey)));
     } else if (grid && _media) {
       body = GridView.builder(
+        cacheExtent: 0,
+        findChildIndexCallback: (key) => _positions[(key as ValueKey<String>).value],
         padding: const EdgeInsets.only(bottom: 90),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, crossAxisSpacing: 2, mainAxisSpacing: 2),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
           return InkWell(
+            key: ValueKey(it.e.path),
             onTap: () => _tap(it),
             onLongPress: () => setState(() => sel.add(it.e.path)),
             child: LayoutBuilder(
               builder: (_, c) => Stack(fit: StackFit.expand, children: [
-                mediaThumb(it.e.path, c.maxWidth),
+                mediaThumb(it.e, c.maxWidth),
                 if (on) Container(color: Colors.black26),
                 if (selecting) Positioned(right: 6, bottom: 6, child: tickMark(on)),
               ]),
@@ -1564,12 +1625,15 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       );
     } else if (grid) {
       body = GridView.builder(
+        cacheExtent: 0,
+        findChildIndexCallback: (key) => _positions[(key as ValueKey<String>).value],
         padding: const EdgeInsets.fromLTRB(6, 6, 6, 90),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, childAspectRatio: 0.7),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
           return InkWell(
+            key: ValueKey(it.e.path),
             borderRadius: BorderRadius.circular(10),
             onTap: () => _tap(it),
             onLongPress: () => setState(() => sel.add(it.e.path)),
@@ -1602,11 +1666,14 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       );
     } else {
       body = ListView.builder(
+        cacheExtent: 0,
+        findChildIndexCallback: (key) => _positions[(key as ValueKey<String>).value],
         padding: const EdgeInsets.only(bottom: 90),
         itemCount: items.length,
         itemBuilder: (_, i) {
           final it = items[i], on = sel.contains(it.e.path);
           return ListTile(
+            key: ValueKey(it.e.path),
             selected: on,
             selectedTileColor: blue.withAlpha(40),
             leading: SizedBox(width: 42, height: 42, child: on ? const Icon(Icons.check_circle, size: 36, color: blue) : fileIcon(it)),
@@ -1698,8 +1765,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       } else if (v == 'empty') {
                         _purge(items.map((i) => i.e.path).toList());
                       } else if (v == 'refresh') {
-                        invalidateScan();
-                        _load();
+                        _load(force: true, audit: isDir);
                       } else if (v == 'hidden') {
                         hidden = !hidden;
                         prefs.setBool('hidden', hidden);
@@ -2243,22 +2309,24 @@ class MediaCatPage extends StatefulWidget {
 class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && mounted) {
-      invalidateScan();
-      _load();
-    }
+    if (state == AppLifecycleState.resumed) _pollVisible();
   }
 
   @override
   void dispose() {
+    _poll?.cancel();
+    _debounce?.cancel();
+    unawaited(_catalogSubscription?.cancel());
     WidgetsBinding.instance.removeObserver(this);
     volumeChanges.removeListener(_volumeChanged);
     super.dispose();
   }
 
   bool loading = true, folders = true;
-  List<String> all = [];
-  List<MapEntry<String, List<String>>> groups = [];
+  List<StorageEntry> all = [];
+  List<MapEntry<String, List<StorageEntry>>> groups = [];
+  Timer? _poll, _debounce;
+  StreamSubscription<String>? _catalogSubscription;
 
   bool get isVideo => widget.cat.name == 'Video';
 
@@ -2267,6 +2335,11 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     volumeChanges.addListener(_volumeChanged);
+    _catalogSubscription = catalog.changes.listen((_) {
+      _debounce?.cancel();
+      _debounce = Timer(const Duration(milliseconds: 160), _pollVisible);
+    });
+    _poll = Timer.periodic(const Duration(seconds: 20), (_) => _pollVisible());
     _load();
   }
 
@@ -2274,29 +2347,41 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
 
   void _volumeChanged() => unawaited(_load());
 
-  Future<void> _load() async {
-    final generation = ++_loadGeneration;
-    final its = (await scan(removable: true)).where((e) => widget.cat.exts.contains(extOf(e.path))).map(Item.new).toList();
-    its.sort((a, b) => b.e.modified.compareTo(a.e.modified));
-    final fs = its.map((i) => i.e.path).toList();
-    final m = <String, List<String>>{};
-    for (final x in fs) {
-      m.putIfAbsent(p.dirname(x), () => []).add(x);
+  void _pollVisible() {
+    if (mounted && catalog.foreground && (ModalRoute.of(context)?.isCurrent ?? true)) {
+      unawaited(_load());
     }
-    final g = m.entries.toList();
-    if (!mounted || generation != _loadGeneration) return;
-    setState(() {
-      all = fs;
-      groups = g;
-      loading = false;
-    });
   }
 
-  Widget _thumb(String path, double s) {
-    if (isSaf(path)) return mediaThumb(path, s);
-    if (isVideo) return VideoThumb(key: ValueKey(path), path: path, size: s);
-    return Image.file(File(path), width: s, height: s, fit: BoxFit.cover, cacheWidth: 360, errorBuilder: (_, __, ___) => SizedBox(width: s, height: s, child: Icon(widget.cat.icon, size: s * 0.5, color: widget.cat.color)));
+  Future<void> _load({bool force = false}) async {
+    final generation = ++_loadGeneration;
+    final roots = _roots(true);
+    await catalog.ready;
+    if (!mounted || generation != _loadGeneration) return;
+
+    void show(List<StorageEntry> entries) {
+      if (!mounted || generation != _loadGeneration) return;
+      final files = entries.where((entry) => widget.cat.exts.contains(extOf(entry.path))).toList()
+        ..sort((a, b) => b.modified.compareTo(a.modified));
+      if (!loading && _sameEntries(all, files)) return;
+      final many = <String, List<StorageEntry>>{};
+      for (final entry in files) {
+        many.putIfAbsent(p.dirname(entry.path), () => []).add(entry);
+      }
+      setState(() {
+        all = files;
+        groups = many.entries.toList();
+        loading = false;
+      });
+    }
+
+    final cached = catalog.cachedTree(roots);
+    if (cached != null) show(cached);
+    await catalog.refreshTree(roots, force: force);
+    show(catalog.cachedTree(roots) ?? []);
   }
+
+  Widget _thumb(StorageEntry entry, double s) => mediaThumb(entry, s, square: !isVideo);
 
   Widget _chip(String label, IconData icon, bool on, VoidCallback tap) => Padding(
         padding: const EdgeInsets.only(right: 8),
@@ -2312,6 +2397,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
       body = const Center(child: Text('Chưa có tập tin nào thuộc loại này.', style: TextStyle(color: Colors.grey)));
     } else if (folders) {
       body = GridView.builder(
+        cacheExtent: 0,
         padding: const EdgeInsets.fromLTRB(10, 4, 10, 24),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 10, mainAxisSpacing: 10),
         itemCount: groups.length,
@@ -2348,11 +2434,12 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
       );
     } else {
       body = GridView.builder(
+        cacheExtent: 0,
         padding: const EdgeInsets.only(bottom: 24),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, crossAxisSpacing: 2, mainAxisSpacing: 2),
         itemCount: all.length,
         itemBuilder: (_, i) => InkWell(
-          onTap: () => openFile(context, all[i], siblings: all),
+          onTap: () => openFile(context, all[i].path, siblings: all.map((entry) => entry.path).toList()),
           child: LayoutBuilder(builder: (_, c) => mediaThumb(all[i], c.maxWidth)),
         ),
       );
@@ -2367,9 +2454,7 @@ class _MediaCatState extends State<MediaCatPage> with WidgetsBindingObserver {
               tooltip: 'Làm mới',
               icon: const Icon(Icons.refresh),
               onPressed: () {
-                invalidateScan();
-                setState(() => loading = true);
-                _load();
+                _load(force: true);
               }),
         ],
       ),
