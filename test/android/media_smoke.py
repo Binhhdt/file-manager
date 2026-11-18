@@ -12,7 +12,7 @@ ACTIVITY = f"{PACKAGE}/.MainActivity"
 
 
 def run(*args, check=True, timeout=25):
-    return subprocess.run(args, check=check, text=True, encoding="utf-8",
+    return subprocess.run(args, check=check, text=True, encoding="utf-8", errors="replace",
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
 
 
@@ -44,11 +44,8 @@ def key(name):
 
 def tap(label):
     def bounds():
-        result = adb("shell", "uiautomator", "dump", "--compressed", "/sdcard/fm-ui.xml",
-                     check=False)
-        if "UI hierchary dumped" not in result and "UI hierarchy dumped" not in result:
-            return None
-        root = ET.fromstring(adb("exec-out", "cat", "/sdcard/fm-ui.xml"))
+        adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
+        root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
         for node in root.iter("node"):
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
             if label not in text:
@@ -67,12 +64,17 @@ def session(track=None, playing=True):
     for part in re.split(r"(?=\n\s*[^\n]*package=)", text):
         if f"package={PACKAGE}" not in part:
             continue
-        state = re.search(r"state\s*=\s*PlaybackState\s*\{state=(\d+),\s*position=(-?\d+)", part)
+        state = re.search(r"state\s*=\s*PlaybackState\s*\{state=(?:[A-Z_]+\()?(\d+)\)?,\s*position=(-?\d+)", part)
         if not state or (track and track.lower() not in part.lower()):
             continue
         if playing is not None and (state[1] == "3") != playing:
             continue
-        return max(0, int(state[2])) + 1
+        position = max(0, int(state[2]))
+        timing = re.search(r"speed=([\d.]+),\s*updated=(\d+)", part)
+        if state[1] == "3" and timing:
+            uptime_ms = float(adb("shell", "cat", "/proc/uptime").split()[0]) * 1000
+            position += int(max(0, uptime_ms - int(timing[2])) * float(timing[1]))
+        return position + 1
     return False
 
 
@@ -107,10 +109,15 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
             adb("push", str(file), f"/sdcard/Download/{file.name}")
         for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
             adb("shell", "settings", "put", "global", setting, "0")
+        adb("shell", "wm", "size", "720x1600")
+        adb("shell", "wm", "density", "240")
         key("KEYCODE_WAKEUP")
+        adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
         foreground()
-        tap("Download")
+        tap("Tìm kiếm")
+        adb("shell", "input", "text", "fm-")
+        key("KEYCODE_ENTER")
         tap("00-fm-short.mp3")
         wait("auto advance to second track", lambda: session("01-fm-second"))
         print("PASS audio decoding and auto advance", flush=True)
@@ -155,7 +162,7 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         after = wait("video audio after elapsed time", lambda: session("03-fm-video"))
         tap("Mở trình phát")
         reopened = wait("same video after reopening the page", lambda: session("03-fm-video"))
-        assert after >= before and reopened >= after - 2000
+        assert after > before + 2000 and reopened >= after - 2000
         print(f"PASS video background and same session on reopen ({before}, {after}, {reopened})", flush=True)
 
         if version >= 26 and "android.software.picture_in_picture" in adb("shell", "pm", "list", "features"):
@@ -175,6 +182,8 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
              adb("shell", "dumpsys", "activity", "services", PACKAGE))
         print("PASS explicit stop releases foreground playback", flush=True)
     except Exception:
+        print("Latest hierarchy:", adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml", check=False), flush=True)
+        print("Package activity:", adb("shell", "dumpsys", "activity", "activities", PACKAGE, check=False), flush=True)
         print(adb("shell", "dumpsys", "media_session", check=False), flush=True)
         print(adb("shell", "dumpsys", "activity", "services", PACKAGE, check=False), flush=True)
         print(adb("logcat", "-d", "-t", "500", check=False), flush=True)
