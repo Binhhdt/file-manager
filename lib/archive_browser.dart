@@ -239,8 +239,7 @@ class _ArchivePageState extends State<_ArchivePage> {
           throw FileSystemException(
               'Tập tin nén đã thay đổi. Hãy tải lại mục lục.');
         }
-        final attempt = await Directory(p.join(widget.staging.path, 'extract-'))
-            .createTemp();
+        final attempt = await widget.staging.createTemp('extract-');
         final output = await Directory(p.join(attempt.path, 'output')).create();
         try {
           if (!mounted) return;

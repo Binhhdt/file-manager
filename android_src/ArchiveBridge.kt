@@ -52,9 +52,14 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
                     if (!path.isFile) throw IOException("Không đọc được tập tin nén")
                     val destination = call.argument<String>("destination")?.let(::File)
                     if (destination != null) {
-                        val root = activity.cacheDir.canonicalPath + File.separator
-                        require(destination.canonicalPath.startsWith(root) &&
-                            destination.isDirectory && destination.list()?.isEmpty() == true)
+                        val output = destination.canonicalFile
+                        val attempt = requireNotNull(output.parentFile)
+                        val staging = requireNotNull(attempt.parentFile)
+                        val cache = requireNotNull(staging.parentFile)
+                        val allowed = listOf(activity.cacheDir.canonicalFile, activity.codeCacheDir.canonicalFile)
+                        require(cache in allowed && staging.name.startsWith("fm-open-archive-") &&
+                            attempt.name.startsWith("extract-") && output.name == "output" &&
+                            output.isDirectory && output.list()?.isEmpty() == true)
                     }
                     val selected = call.argument<List<Int>>("indices")?.toSet()
                     val details = inspect(path, password, destination, selected, cancel) { count ->
@@ -66,7 +71,8 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
                     val kind = when {
                         cancel.get() -> "cancel"
                         message.contains("unsupported", true) ||
-                            message.contains("not supported", true) -> "unsupported"
+                            message.contains("not supported", true) ||
+                            message.contains("encryption support unavailable", true) -> "unsupported"
                         message.contains("password", true) || message.contains("passphrase", true) ||
                             (password == null && message.contains("encrypt", true)) -> "password"
                         message.contains("ENOSPC", true) || message.contains("No space", true) -> "space"
