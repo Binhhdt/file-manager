@@ -805,7 +805,13 @@ Future<void> main() async {
     onCommit: playlists.applyRenames, markPaths: catalog.markPaths,
   );
   duplicateScan = DuplicateScan(storage, File(p.join(privatePath, 'fm-duplicates.json')));
-  vault = VaultStore(Directory(p.join(privatePath, 'fm-vault')), storage);
+  vault = VaultStore(Directory(p.join(privatePath, 'fm-vault')), storage,
+    deviceEnvelope: Platform.isAndroid ? (data, {required bool seal}) async {
+      final result = await nativeCh.invokeMethod<Uint8List>(seal ? 'vaultSeal' : 'vaultUnseal', {'data': data});
+      if (result == null) throw const FileSystemException('Không truy cập được khóa Android Keystore');
+      return result;
+    } : null,
+  );
   if (Platform.isAndroid) await _cleanVaultStages();
   trash = Trash(operations, Directory(p.join(privatePath, 'fm-trash')), trashDir, rootPath, getTrash, (path) async {
     final old = getTrash()..remove(path);

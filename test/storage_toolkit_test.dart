@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:file_manager/batch_rename.dart';
 import 'package:file_manager/file_catalog.dart';
 import 'package:file_manager/file_operations.dart';
@@ -50,6 +52,19 @@ class _FullBackupStorage extends Storage {
     await File(dest).writeAsBytes([0, 1, 2]);
     throw const FileSystemException('Disk full', null, OSError('ENOSPC', 28));
   }
+}
+
+VaultDeviceEnvelope _testEnvelope(int device) {
+  final cipher = AesGcm.with256bits();
+  final key = SecretKey(List.filled(32, device));
+  return (data, {required bool seal}) async {
+    if (seal)
+      return (await cipher.encrypt(data, secretKey: key)).concatenation();
+    return Uint8List.fromList(await cipher.decrypt(
+        SecretBox.fromConcatenation(data,
+            nonceLength: cipher.nonceLength, macLength: 16),
+        secretKey: key));
+  };
 }
 
 void main() {
@@ -221,9 +236,13 @@ void main() {
     final original = await File(p.join(subdir.path, 'Tệp tiếng Việt.txt'))
         .writeAsString('nội dung riêng tư');
     final root = Directory(p.join(temp.path, 'vault'));
-    final vault = VaultStore(root, storage);
+    final vault = VaultStore(root, storage, deviceEnvelope: _testEnvelope(1));
     addTearDown(vault.lock);
     await vault.unlock(originalPassword, create: true);
+    expect(
+        jsonDecode(await File(p.join(root.path, 'vault.json')).readAsString())[
+            'version'],
+        2);
     await expectLater(vault.importFile(source.path, _Progress(1)),
         throwsA(isA<TransferCancelled>()));
     expect(await root.list().map((node) => p.basename(node.path)).toList(),
@@ -243,6 +262,10 @@ void main() {
 
     final snapshot = await Directory(p.join(temp.path, 'backup')).create();
     await vault.backupTo(snapshot, _Progress());
+    expect(
+        jsonDecode(await File(p.join(snapshot.path, 'vault.json'))
+            .readAsString())['version'],
+        1);
     await vault.changePassword(originalPassword, nextPassword, _Progress());
     vault.lock();
     await expectLater(vault.unlock(originalPassword, create: false),
@@ -261,7 +284,8 @@ void main() {
         await temp.list().any(
             (node) => p.basename(node.path).startsWith('fm-vault-restore-')),
         isFalse);
-    final recovered = VaultStore(newRoot, storage);
+    final recovered =
+        VaultStore(newRoot, storage, deviceEnvelope: _testEnvelope(2));
     addTearDown(recovered.lock);
     final tag = File(p.join(snapshot.path, 'vault-backup.tag'));
     final checksum = await tag.readAsString();
@@ -273,6 +297,10 @@ void main() {
     expect(await newRoot.exists(), isFalse);
     await tag.writeAsString(checksum);
     await recovered.restoreBackup(snapshot.path, originalPassword, _Progress());
+    expect(
+        jsonDecode(await File(p.join(newRoot.path, 'vault.json'))
+            .readAsString())['version'],
+        2);
     await recovered.unlock(originalPassword, create: false);
     final (restored, _) = await recovered.list(_Progress());
     final output = p.join(temp.path, 'output');

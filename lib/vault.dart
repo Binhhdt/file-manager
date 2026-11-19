@@ -47,14 +47,18 @@ class VaultItem {
       {this.isDir = false, this.children = 0, this.ancestors = const []});
 }
 
+typedef VaultDeviceEnvelope = Future<Uint8List> Function(Uint8List data,
+    {required bool seal});
+
 class VaultStore {
   final Directory root;
   final Storage storage;
+  final VaultDeviceEnvelope? deviceEnvelope;
   final _cipher = AesGcm.with256bits();
   SecretKeyData? _master;
   int _generation = 0;
 
-  VaultStore(this.root, this.storage);
+  VaultStore(this.root, this.storage, {this.deviceEnvelope});
 
   File get _config => File(p.join(root.path, 'vault.json'));
   bool get unlocked => _master != null;
@@ -118,29 +122,74 @@ class VaultStore {
     try {
       final box = await _cipher.encrypt(master,
           secretKey: key, aad: utf8.encode('$_version:master'));
-      check();
-      await writeStorageRecord(_config, {
-        'version': 1,
-        'salt': base64Encode(salt),
-        'key': base64Encode(box.concatenation()),
-      });
+      await _writeLocalConfig(
+          _config,
+          {
+            'version': 1,
+            'salt': base64Encode(salt),
+            'key': base64Encode(box.concatenation()),
+          },
+          check);
     } finally {
       key.destroy();
       derived.fillRange(0, derived.length, 0);
     }
   }
 
-  Future<List<int>> _unwrap(File config, String password) async {
+  Future<void> _writeLocalConfig(
+      File config, Map<String, Object> portable, void Function() check) async {
+    final envelope = deviceEnvelope;
+    if (envelope == null) {
+      check();
+      await writeStorageRecord(config, portable);
+      return;
+    }
+    final data = Uint8List.fromList(utf8.encode(jsonEncode(portable)));
+    try {
+      check();
+      final protected = await envelope(data, seal: true);
+      check();
+      await writeStorageRecord(
+          config, {'version': 2, 'device': base64Encode(protected)});
+    } finally {
+      data.fillRange(0, data.length, 0);
+    }
+  }
+
+  Future<Map<String, Object>> _readConfig(File config) async {
     if (await config.length() > 4096) {
       throw const FormatException('Cấu hình thư mục riêng tư không hợp lệ');
     }
-    final row = jsonDecode(await config.readAsString());
+    var row = jsonDecode(await config.readAsString());
+    if (row is Map && row['version'] == 2) {
+      final envelope = deviceEnvelope;
+      if (envelope == null || row['device'] is! String) {
+        throw const FileSystemException(
+            'Cần khóa Android Keystore của thiết bị này');
+      }
+      final data =
+          await envelope(base64Decode(row['device'] as String), seal: false);
+      try {
+        row = jsonDecode(utf8.decode(data));
+      } finally {
+        data.fillRange(0, data.length, 0);
+      }
+    }
     if (row is! Map ||
         row['version'] != 1 ||
         row['salt'] is! String ||
         row['key'] is! String) {
       throw const FormatException('Cấu hình thư mục riêng tư không hợp lệ');
     }
+    return {
+      'version': 1,
+      'salt': row['salt'] as String,
+      'key': row['key'] as String
+    };
+  }
+
+  Future<List<int>> _unwrap(File config, String password) async {
+    final row = await _readConfig(config);
     final salt = base64Decode(row['salt'] as String);
     final wrapped = base64Decode(row['key'] as String);
     if (salt.length != 24 ||
@@ -679,6 +728,8 @@ class VaultStore {
       throw const FileSystemException('Vị trí sao lưu phải trống');
     }
     await _verifyObjects(progress);
+    final snapshotConfig = File(p.join(destination.path, 'vault.json'));
+    await writeStorageRecord(snapshotConfig, await _readConfig(_config));
     await _copySnapshot(root.path, destination, progress, restore: false);
     final tag = await _snapshotMac(destination, progress);
     progress.check();
@@ -710,6 +761,11 @@ class VaultStore {
       await _copySnapshot(source, stage, progress, restore: true);
       await copy._verifySnapshot(stage, progress);
       await copy._verifyObjects(progress);
+      await _writeLocalConfig(
+          copy._config, await copy._readConfig(copy._config), () {
+        progress.check();
+        _checkGeneration(generation);
+      });
       await File(p.join(stage.path, _backupTag)).delete();
       progress.check();
       _checkGeneration(generation);
@@ -753,7 +809,7 @@ class VaultStore {
                     restore &&
                     name == _backupTag &&
                     entry.size == 44))) {
-          if (depth == 0 && restore && name == 'vault.json') continue;
+          if (depth == 0 && name == 'vault.json') continue;
           await storage.copyFile(entry.path, target, progress: progress);
         } else {
           throw const FormatException('Bản sao chứa mục không hợp lệ');

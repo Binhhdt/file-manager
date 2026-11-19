@@ -285,7 +285,13 @@ def main():
     adb("shell", "am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity")
     wait("vault locked on return", lambda: node("Mở khóa", exact=True, clickable=True))
     assert not node("Verified private preview", exact=True)
-    print("PASS vault creates encrypted copy, previews text and locks on Home", flush=True)
+    tap("Mở khóa", exact=True, clickable=True)
+    wait("vault unlock dialog", lambda: node("Mở khóa thư mục"))
+    enter_password_field(0, "SmokeVaultPassword123")
+    tap("Mở khóa", exact=True, clickable=True)
+    tap("fmkit-vault.txt")
+    wait("private preview after unlock", lambda: node("Verified private preview", exact=True))
+    print("PASS vault roundtrip, private preview, lock on Home and unlock with Android Keystore", flush=True)
 
 
 if __name__ == "__main__":

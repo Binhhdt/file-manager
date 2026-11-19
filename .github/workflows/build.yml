@@ -81,7 +81,7 @@ jobs:
       - name: Ma Android goc va icon ung dung
         run: |
           K=$(find android/app/src/main -name MainActivity.kt)
-          cp android_src/StorageBridge.kt android_src/ArchiveBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt "$(dirname "$K")/"
+          cp android_src/StorageBridge.kt android_src/ArchiveBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt android_src/VaultDeviceKey.kt "$(dirname "$K")/"
           cat > "$K" <<'EOF'
           package com.fmdemo.file_manager
 
@@ -249,6 +249,27 @@ jobs:
                   media = MediaBridge(this, flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
+                      if (method == "vaultSeal" || method == "vaultUnseal") {
+                          val input = call.argument<ByteArray>("data")
+                          if (input == null) {
+                              result.error("vaultKey", "Thiếu dữ liệu cấu hình kho", null)
+                              return@setMethodCallHandler
+                          }
+                          Thread {
+                              try {
+                                  val output = if (method == "vaultSeal") VaultDeviceKey.seal(input)
+                                      else VaultDeviceKey.unseal(input)
+                                  runOnUiThread { result.success(output) }
+                              } catch (_: Exception) {
+                                  runOnUiThread {
+                                      result.error("vaultKey", "Không truy cập được khóa kho trong Android Keystore. Có thể phục hồi từ bản sao đã mã hóa.", null)
+                                  }
+                              } finally {
+                                  input.fill(0)
+                              }
+                          }.start()
+                          return@setMethodCallHandler
+                      }
                       if (method == "vaultScreen") {
                           if (call.argument<String>("src") == "1") {
                               window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
