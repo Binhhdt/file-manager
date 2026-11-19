@@ -37,7 +37,7 @@ Future<void> undoBatchRename(BuildContext context) async {
             'Dùng lại các tên ban đầu nếu tất cả tập tin vẫn còn ở đúng vị trí.',
             'Hoàn tác') ||
         !context.mounted) return;
-    final job = app.Job();
+    final job = app.Job(unit: 'bước');
     var total = 0;
     await app.runJob(context, 'Đang hoàn tác đổi tên', job, () async {
       total = await app.batchRename.undo(job, start: job.start);
@@ -141,7 +141,7 @@ class _BatchRenamePageState extends State<BatchRenamePage> {
       _applying = true;
       _notice = null;
     });
-    final job = app.Job();
+    final job = app.Job(unit: 'bước');
     try {
       var changed = 0;
       await app.runJob(context, 'Đang đổi tên hàng loạt', job, () async {

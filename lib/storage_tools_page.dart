@@ -190,7 +190,7 @@ class _StorageToolsPageState extends State<StorageToolsPage> {
       _busy = true;
       _notice = null;
     });
-    final job = app.Job()..start(files.length);
+    final job = app.Job(unit: 'mục')..start(files.length);
     final done = <String>{};
     final errors = <String>[];
     var bytes = 0;

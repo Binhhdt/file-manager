@@ -30,6 +30,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _screenProtection(true);
     unawaited(app.vault.configured().then((value) {
       if (mounted) setState(() => _configured = value);
     }));
@@ -38,9 +39,19 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _screenProtection(false);
     _job?.cancelled = true;
     app.vault.lock();
     super.dispose();
+  }
+
+  void _screenProtection(bool enabled) {
+    if (Platform.isAndroid) {
+      unawaited(app.nativeCh.invokeMethod<void>(
+        'vaultScreen',
+        {'src': enabled ? '1' : '0'},
+      ).catchError((Object _) {}));
+    }
   }
 
   @override

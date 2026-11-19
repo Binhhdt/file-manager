@@ -8,6 +8,10 @@ on:
         description: Kiem thu media tren Android Emulator sau khi build
         type: boolean
         default: false
+      android_toolkit_smoke:
+        description: Kiem thu tap tin nen va PDF tren Android Emulator
+        type: boolean
+        default: false
       media_smoke_apk_run:
         description: Run ID cua APK da build de chay lai kiem thu
         type: string
@@ -59,13 +63,16 @@ jobs:
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           python3 android_src/configure_media.py
           python3 android_src/configure_vault.py
+          mkdir -p android/app/src/main/assets/notices
+          cp android_src/licenses/*.txt android/app/src/main/assets/notices/
           cat >> android/app/build.gradle.kts <<'EOF'
           android {
               compileOptions.isCoreLibraryDesugaringEnabled = true
+              packaging.resources.merges += setOf("META-INF/LICENSE.txt", "META-INF/NOTICE.txt")
           }
           dependencies {
               coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
-              implementation("me.zhanghai.android.libarchive:library:1.1.7")
+              implementation("me.zhanghai.android.libarchive:library:1.1.6")
               implementation("org.apache.commons:commons-compress:1.28.0")
               implementation("org.tukaani:xz:1.12")
           }
@@ -242,6 +249,15 @@ jobs:
                   media = MediaBridge(this, flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
+                      if (method == "vaultScreen") {
+                          if (call.argument<String>("src") == "1") {
+                              window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                          } else {
+                              window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                          }
+                          result.success(null)
+                          return@setMethodCallHandler
+                      }
                   if (method == "keepOn") {
                       if (call.argument<String>("src") == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                       else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -337,7 +353,7 @@ jobs:
 
 
   media-smoke:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.android_media_smoke && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.media_smoke_apk_run != '')) }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.android_media_smoke || inputs.android_toolkit_smoke) && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.media_smoke_apk_run != '')) }}
     needs: build
     permissions:
       contents: read
@@ -371,6 +387,8 @@ jobs:
       - uses: reactivecircus/android-emulator-runner@v2
         env:
           FM_SMOKE_APK: smoke-apk/app-release.apk
+          FM_MEDIA_SMOKE: ${{ inputs.android_media_smoke }}
+          FM_TOOLKIT_SMOKE: ${{ inputs.android_toolkit_smoke }}
         with:
           api-level: ${{ matrix.api }}
           target: google_apis
@@ -378,4 +396,7 @@ jobs:
           disable-animations: true
           emulator-boot-timeout: 300
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
-          script: python3 -u test/android/media_smoke.py
+          script: |
+            set -e
+            if [ "$FM_TOOLKIT_SMOKE" = "true" ]; then python3 -u test/android/toolkit_smoke.py; fi
+            if [ "$FM_MEDIA_SMOKE" = "true" ]; then python3 -u test/android/media_smoke.py; fi

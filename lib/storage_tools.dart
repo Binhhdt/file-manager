@@ -11,11 +11,7 @@ import 'storage.dart';
 bool excludedFromTools(String path) {
   final parts = p.split(path.toLowerCase());
   return parts.any(privateStorageName) ||
-      parts.any((part) => part == '.fmvault') ||
-      parts.indexed.any((part) =>
-          part.$2 == 'android' &&
-          part.$1 + 1 < parts.length &&
-          const {'data', 'obb', 'media'}.contains(parts[part.$1 + 1]));
+      parts.any((part) => part == '.fmvault' || part == 'android');
 }
 
 class StorageSurvey {

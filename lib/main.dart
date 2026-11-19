@@ -141,6 +141,9 @@ class Job implements TransferProgress {
   final progress = ValueNotifier<double>(0);
   final label = ValueNotifier<String>('');
   final canCancel = ValueNotifier<bool>(true);
+  final String? unit;
+  Job({this.unit});
+  String format(int amount) => unit == null ? fmtSize(amount) : '$amount $unit';
   bool cancelled = false;
 
   @override
@@ -264,7 +267,7 @@ Future<void> runJob(BuildContext context, String title, Job job, Future<void> Fu
             builder: (_, v, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               LinearProgressIndicator(value: v > 0 ? v : null, minHeight: 6),
               const SizedBox(height: 6),
-              Text(v > 0 ? '${(v * 100).floor()}%   ${fmtSize(job.done)} / ${fmtSize(job.total)}' : 'Đang chuẩn bị...', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              Text(v > 0 ? '${(v * 100).floor()}%   ${job.format(job.done)} / ${job.format(job.total)}' : 'Đang chuẩn bị...', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
             ]),
           ),
         ]),
@@ -1118,6 +1121,8 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
               const SizedBox(height: 12),
               FilledButton(onPressed: _init, child: const Text('Cấp quyền')),
               TextButton(onPressed: openAppSettings, child: const Text('Mở cài đặt ứng dụng')),
+              if (Platform.isAndroid)
+                TextButton(onPressed: () => _open(const VaultPage()), child: const Text('Thư mục riêng tư')),
               for (final volume in vols) _volCard(volume),
               if (vols.any((volume) => volume.path != null)) ...[
                 _categoryTiles(),

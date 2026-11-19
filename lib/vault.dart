@@ -351,8 +351,11 @@ class VaultStore {
       VaultItem item, File target, TransferProgress progress) async {
     final source = _object(item.id);
     final key = await _key(item.id);
+    var created = false;
+    var verified = false;
     try {
       await target.create(exclusive: true);
+      created = true;
       final output = await target.open(mode: FileMode.writeOnly);
       try {
         final actual =
@@ -363,12 +366,15 @@ class VaultStore {
         if (actual.name != item.name || actual.size != item.size) {
           throw const FileSystemException('Tệp riêng tư đã thay đổi');
         }
+        progress.check();
         await output.flush();
       } finally {
         await output.close();
       }
+      verified = true;
     } finally {
       key.destroy();
+      if (created && !verified) await target.delete();
     }
   }
 }
