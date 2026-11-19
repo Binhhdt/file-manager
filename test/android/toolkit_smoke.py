@@ -264,7 +264,11 @@ def main():
     print("PASS PDF password prompt, wrong-password retry and opening", flush=True)
 
     extract("fmkit-large.zip", "large.bin")
-    checksum = adb("shell", "sha256sum", f"{SAMPLES}/fmkit-large/large.bin").split()[0]
+    with tempfile.TemporaryDirectory(prefix="fm-toolkit-extracted-") as extracted:
+        output = Path(extracted) / "large.bin"
+        adb("pull", f"{SAMPLES}/fmkit-large/large.bin", str(output))
+        with output.open("rb") as stream:
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
     assert digest == checksum
     print("PASS SHA-256 equality of 24 MiB archived fixture", flush=True)
 
