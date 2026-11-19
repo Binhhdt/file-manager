@@ -58,7 +58,7 @@ class PdfReaderPage extends StatefulWidget {
 
 class _PdfReaderPageState extends State<PdfReaderPage> {
   final _controller = PdfViewerController();
-  late final _search = PdfTextSearcher(_controller);
+  PdfTextSearcher? _search;
   late final _key = 'pdf.${sha256.convert(utf8.encode(widget.source))}';
   late final _initial = app.prefs.getInt('$_key.page') ?? 1;
   late final _document = PdfDocumentRefByLoader((_) async {
@@ -84,7 +84,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
 
   @override
   void dispose() {
-    _search.dispose();
+    _search?.dispose();
     super.dispose();
   }
 
@@ -179,6 +179,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
 
   @override
   Widget build(BuildContext context) {
+    final search = _search;
     return Theme(
       data: _dark
           ? ThemeData.dark(useMaterial3: true)
@@ -190,10 +191,10 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
           actions: [
             IconButton(
               tooltip: 'Tìm trong PDF',
-              onPressed: _pages == 0
+              onPressed: search == null
                   ? null
                   : () {
-                      if (_find) _search.resetTextSearch();
+                      if (_find) search.resetTextSearch();
                       setState(() => _find = !_find);
                     },
               icon: Icon(_find ? Icons.close : Icons.search),
@@ -223,7 +224,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
           ],
         ),
         body: Column(children: [
-          if (_find)
+          if (_find && search != null)
             Row(children: [
               Expanded(
                   child: Padding(
@@ -234,23 +235,23 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                   decoration: const InputDecoration(
                       labelText: 'Từ khóa trong tài liệu'),
                   onChanged: (value) => value.trim().isEmpty
-                      ? _search.resetTextSearch()
-                      : _search.startTextSearch(value),
+                      ? search.resetTextSearch()
+                      : search.startTextSearch(value),
                 ),
               )),
               AnimatedBuilder(
-                animation: _search,
-                builder: (_, __) => Text(_search.isSearching
-                    ? '${_search.matches.length}…'
-                    : '${_search.matches.length} kết quả'),
+                animation: search,
+                builder: (_, __) => Text(search.isSearching
+                    ? '${search.matches.length}…'
+                    : '${search.matches.length} kết quả'),
               ),
               IconButton(
                   tooltip: 'Kết quả trước',
-                  onPressed: _search.goToPrevMatch,
+                  onPressed: search.goToPrevMatch,
                   icon: const Icon(Icons.keyboard_arrow_up)),
               IconButton(
                   tooltip: 'Kết quả sau',
-                  onPressed: _search.goToNextMatch,
+                  onPressed: search.goToNextMatch,
                   icon: const Icon(Icons.keyboard_arrow_down)),
             ]),
           Expanded(
@@ -273,11 +274,14 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                 setState(() {
                   _pages = document.pages.length;
                   _page = initial;
+                  _search ??= PdfTextSearcher(controller);
                 });
                 unawaited(app.prefs.setInt('$_key.page', initial));
               },
               onPageChanged: _changed,
-              pagePaintCallbacks: [_search.pageTextMatchPaintCallback],
+              pagePaintCallbacks: [
+                if (search != null) search.pageTextMatchPaintCallback
+              ],
               onGeneralTap: (_, __, details) {
                 if (details.type != PdfViewerGeneralTapType.doubleTap)
                   return false;
