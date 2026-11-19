@@ -237,9 +237,10 @@ class MediaPlaybackService : MediaSessionService(), Player.Listener {
         .setMediaMetadata(MediaMetadata.Builder().setDisplayTitle(File(path).name).setIsPlayable(true).build())
         .build()
 
-    internal fun open(paths: List<String>, index: Int, isVideo: Boolean, oldPositions: Map<String, Long>) {
+    internal fun open(paths: List<String>, index: Int, isVideo: Boolean, oldPositions: Map<String, Long>,
+        shuffleOverride: Boolean? = null) {
         require(paths.isNotEmpty() && index in paths.indices && paths.all { it.startsWith("/") })
-        if (currentPath == paths[index] && video == isVideo && error == null) return
+        if (currentPath == paths[index] && video == isVideo && error == null && shuffleOverride == null) return
         savePosition()
         changingQueue = true
         try {
@@ -255,6 +256,7 @@ class MediaPlaybackService : MediaSessionService(), Player.Listener {
             if (isVideo) resumeCandidate = videoPosition(paths[index])
             player.setPauseAtEndOfMediaItems(isVideo)
             player.repeatMode = if (isVideo) Player.REPEAT_MODE_OFF else saved.repeat
+            if (!isVideo && shuffleOverride != null) saved.shuffle = shuffleOverride
             player.shuffleModeEnabled = !isVideo && saved.shuffle
             player.setPlaybackSpeed(saved.speed(isVideo))
             audioAttributes()

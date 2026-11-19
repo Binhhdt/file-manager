@@ -58,11 +58,23 @@ jobs:
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           python3 android_src/configure_media.py
+          python3 android_src/configure_vault.py
+          cat >> android/app/build.gradle.kts <<'EOF'
+          android {
+              compileOptions.isCoreLibraryDesugaringEnabled = true
+          }
+          dependencies {
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
+              implementation("me.zhanghai.android.libarchive:library:1.1.7")
+              implementation("org.apache.commons:commons-compress:1.28.0")
+              implementation("org.tukaani:xz:1.12")
+          }
+          EOF
           cat $M
       - name: Ma Android goc va icon ung dung
         run: |
           K=$(find android/app/src/main -name MainActivity.kt)
-          cp android_src/StorageBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt "$(dirname "$K")/"
+          cp android_src/StorageBridge.kt android_src/ArchiveBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt "$(dirname "$K")/"
           cat > "$K" <<'EOF'
           package com.fmdemo.file_manager
 
@@ -90,6 +102,7 @@ jobs:
           @UnstableApi
           class MainActivity : FlutterActivity() {
               private var storage: StorageBridge? = null
+              private var archives: ArchiveBridge? = null
               private var media: MediaBridge? = null
 
               override fun onStart() {
@@ -117,6 +130,8 @@ jobs:
               override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
                   media?.close()
                   media = null
+                  archives?.close()
+                  archives = null
                   storage?.close()
                   storage = null
                   super.cleanUpFlutterEngine(flutterEngine)
@@ -223,6 +238,7 @@ jobs:
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   storage = StorageBridge(this, flutterEngine.dartExecutor.binaryMessenger)
+                  archives = ArchiveBridge(this, flutterEngine.dartExecutor.binaryMessenger)
                   media = MediaBridge(this, flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method

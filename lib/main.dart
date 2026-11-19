@@ -14,12 +14,21 @@ import 'package:share_plus/share_plus.dart' as sp;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+import 'archive_browser.dart';
+import 'batch_rename.dart';
+import 'batch_rename_page.dart';
 import 'file_catalog.dart';
 import 'file_operations.dart';
 import 'media_player.dart';
+import 'music_playlists.dart';
+import 'pdf_reader.dart';
 import 'storage.dart';
+import 'storage_tools.dart';
+import 'storage_tools_page.dart';
 import 'trash.dart';
 import 'thumbnail_cache.dart';
+import 'vault.dart';
+import 'vault_page.dart';
 
 const rootPath = '/storage/emulated/0';
 
@@ -32,6 +41,10 @@ late SharedPreferences prefs;
 final storage = Storage();
 late FileOperations operations;
 late Trash trash;
+late DuplicateScan duplicateScan;
+late PlaylistStore playlists;
+late BatchRename batchRename;
+late VaultStore vault;
 final volumeChanges = ValueNotifier<int>(0);
 final storageVolumeEvents = ValueNotifier<int>(0);
 
@@ -203,12 +216,13 @@ const textExts = {'txt', 'md', 'json', 'csv', 'log', 'xml', 'html', 'htm', 'js',
 
 bool isArchive(String path) {
   final l = path.toLowerCase();
-  return l.endsWith('.zip') || l.endsWith('.tar') || l.endsWith('.tar.gz') || l.endsWith('.tgz');
+  return const ['.zip', '.tar', '.tar.gz', '.tgz'].any(l.endsWith) ||
+      (Platform.isAndroid && const ['.rar', '.7z'].any(l.endsWith));
 }
 
 String archiveBase(String path) {
   var n = p.basename(path);
-  for (final e in ['.tar.gz', '.tgz', '.tar', '.zip']) {
+  for (final e in ['.tar.gz', '.tgz', '.tar', '.zip', '.rar', '.7z']) {
     if (n.toLowerCase().endsWith(e)) {
       n = n.substring(0, n.length - e.length);
       break;
@@ -702,6 +716,14 @@ Future<void> openExternal(BuildContext context, String path) async {
 }
 
 Future<void> openFile(BuildContext context, String path, {List<String>? siblings}) async {
+  if (Platform.isAndroid && isArchive(path)) {
+    await openArchive(context, path);
+    return;
+  }
+  if (extOf(path) == 'pdf') {
+    await openPdfReader(context, path);
+    return;
+  }
   final c = catOf(path)?.name;
   if (Platform.isAndroid && (c == 'Video' || c == 'Âm thanh')) {
     final queue = (siblings ?? [path]).where((item) => catOf(item)?.name == c).toSet().toList();
@@ -766,6 +788,7 @@ Future<void> openFile(BuildContext context, String path, {List<String>? siblings
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   prefs = await SharedPreferences.getInstance();
+  playlists = PlaylistStore(prefs, mediaPlayback);
   final privatePath = Platform.isAndroid
       ? (await storageChannel.invokeMethod<String>('privateDir'))!
       : Directory.systemTemp.path;
@@ -774,6 +797,13 @@ Future<void> main() async {
   WidgetsBinding.instance.addObserver(_CatalogLifecycle());
   unawaited(catalog.ready);
   operations = FileOperations(storage, Directory(p.join(privatePath, 'fm-transactions')));
+  batchRename = BatchRename(
+    operations, Directory(p.join(privatePath, 'fm-batch-rename')),
+    onCommit: playlists.applyRenames, markPaths: catalog.markPaths,
+  );
+  duplicateScan = DuplicateScan(storage, File(p.join(privatePath, 'fm-duplicates.json')));
+  vault = VaultStore(Directory(p.join(privatePath, 'fm-vault')), storage);
+  if (Platform.isAndroid) await _cleanVaultStages();
   trash = Trash(operations, Directory(p.join(privatePath, 'fm-trash')), trashDir, rootPath, getTrash, (path) async {
     final old = getTrash()..remove(path);
     if (!await prefs.setString('trash', jsonEncode(old))) {
@@ -794,6 +824,19 @@ Future<void> main() async {
     WidgetsBinding.instance.ensureVisualUpdate();
   });
   runApp(const App());
+}
+
+Future<void> _cleanVaultStages() async {
+  try {
+    await vault.cleanWrites();
+    await for (final child in Directory.systemTemp.list(followLinks: false)) {
+      if (child is Directory && p.basename(child.path).startsWith('fm-vault-export-')) {
+        await child.delete(recursive: true);
+      }
+    }
+  } on FileSystemException {
+    // A later startup can remove an app-owned staging directory.
+  }
 }
 
 Future<void> _cleanOpenedDocuments() async {
@@ -911,6 +954,7 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _recover() async {
     try {
       final errors = await operations.recover();
+      await batchRename.recover();
       if (mounted && errors.isNotEmpty) _message('Chưa thể phục hồi thao tác: ${errors.first}');
     } catch (error) {
       if (mounted) _message('Không đọc được nhật ký thao tác: ${storageError(error)}');
@@ -1023,6 +1067,12 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+  void _tools(bool duplicates) => _open(StorageToolsPage(
+    duplicates: duplicates,
+    internal: indexInternal ? const CatalogRoot(rootPath) : null,
+    removable: List.of(volumeRoots),
+  ));
+
   Widget _card(Widget child) => Card(margin: const EdgeInsets.only(bottom: 10), child: Padding(padding: const EdgeInsets.all(12), child: child));
 
   Widget _tile(IconData icon, String label, Color color, VoidCallback onTap, {bool small = false}) => InkWell(
@@ -1071,6 +1121,9 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
               for (final volume in vols) _volCard(volume),
               if (vols.any((volume) => volume.path != null)) ...[
                 _categoryTiles(),
+                TextButton(onPressed: () => _tools(true), child: const Text('Tìm file trùng lặp')),
+                TextButton(onPressed: () => _tools(false), child: const Text('Dọn dung lượng')),
+                TextButton(onPressed: () => _open(const PlaylistLibraryPage()), child: const Text('Playlist nhạc')),
                 TextButton(onPressed: () => _open(const BrowserPage(mode: Mode.trash)), child: const Text('Thùng rác')),
               ],
             ]),
@@ -1106,6 +1159,12 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
             _tile(Icons.history, 'Gần đây', blue, () => _open(const BrowserPage(mode: Mode.recent)), small: true),
             _tile(Icons.delete, 'Thùng rác', blue, () => _open(const BrowserPage(mode: Mode.trash)), small: true),
             _tile(Icons.download, 'Download', blue, () => _open(const BrowserPage(mode: Mode.dir, path: '$rootPath/Download')), small: true),
+            _tile(Icons.content_copy, 'Tìm file trùng lặp', blue, () => _tools(true), small: true),
+            _tile(Icons.cleaning_services, 'Dọn dung lượng', blue, () => _tools(false), small: true),
+            _tile(Icons.queue_music, 'Playlist nhạc', blue, () => _open(const PlaylistLibraryPage()), small: true),
+            _tile(Icons.undo, 'Hoàn tác đổi tên', blue, () => undoBatchRename(context), small: true),
+            if (Platform.isAndroid)
+              _tile(Icons.lock_outline, 'Thư mục riêng tư', blue, () => _open(const VaultPage()), small: true),
           ]),
         ])),
         _card(Column(children: [
@@ -1388,6 +1447,22 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }), 'Đã tạo tập tin');
   }
 
+  void _vaultFiles(List<String> paths) {
+    Navigator.push<void>(context, MaterialPageRoute(
+      builder: (_) => VaultPage(importFiles: paths),
+    ));
+  }
+
+  Future<void> _batchRename(List<String> paths) async {
+    final count = await Navigator.push<int>(context, MaterialPageRoute(
+      builder: (_) => BatchRenamePage(paths: paths),
+    ));
+    if (!mounted || count == null) return;
+    _msg('Đã đổi tên $count tập tin.');
+    setState(sel.clear);
+    await _load(silent: true);
+  }
+
   Future<void> _rename(Item item) async {
     final name = await showDialog<String>(
       context: context,
@@ -1532,6 +1607,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
   }
 
   Future<void> _extract(String path) async {
+    if (Platform.isAndroid) {
+      await openArchive(context, path);
+      return;
+    }
     if (isSaf(path)) {
       await openExternal(context, path);
       return;
@@ -1620,7 +1699,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
       return;
     }
     final path = it.e.path;
-    if (!isSaf(path) && isArchive(path)) {
+    if (!Platform.isAndroid && !isSaf(path) && isArchive(path)) {
       if (await confirm(context, 'Giải nén?', 'Giải nén "${it.name}" vào một thư mục mới cùng chỗ.', 'Giải nén')) await _extract(path);
       return;
     }
@@ -1657,9 +1736,13 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
               o(Icons.open_in_new, 'Mở', () => _openItem(it)),
               if (!it.isDir) o(Icons.apps, 'Mở bằng ứng dụng khác', () => openExternal(context, path)),
               if (!it.isDir) o(Icons.share, 'Chia sẻ', () => shareFiles(context, [path])),
-              if (!isSaf(path) && isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
+              if (isArchive(path) && (Platform.isAndroid || !isSaf(path))) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
               if (!isSaf(path)) o(Icons.archive, 'Nén thành zip', () => _zip([path])),
               o(Icons.edit, 'Đổi tên', () => _rename(it)),
+              if (Platform.isAndroid && it.e.isFile)
+                o(Icons.lock_outline, 'Sao chép vào thư mục riêng tư', () => _vaultFiles([path])),
+              if (!it.isDir && catOf(path)?.name == 'Âm thanh')
+                o(Icons.playlist_add, 'Thêm vào playlist', () => addToPlaylist(context, [path])),
               if (clip.value == null) o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
               if (clip.value == null) o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
               if (it.isDir)
@@ -1745,6 +1828,10 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     final atTop = !isDir || cur == widget.path || cur == rootPath;
     final picked = sel.toList();
     Item one() => items.firstWhere((i) => i.e.path == picked.first);
+    final filesForBatch = picked.where((path) {
+      final index = _positions[path];
+      return index != null && items[index].e.isFile;
+    }).toList();
 
     Widget body;
     if (loading) {
@@ -1896,6 +1983,12 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                         if (v == 'ren') {
                           final index = _positions[picked.first];
                           if (index != null) _rename(items[index]);
+                        } else if (v == 'batchRename') {
+                          _batchRename(filesForBatch);
+                        } else if (v == 'vault') {
+                          _vaultFiles(filesForBatch);
+                        } else if (v == 'playlist') {
+                          addToPlaylist(context, picked);
                         } else if (v == 'info') {
                           _info(one());
                         } else if (v == 'share') {
@@ -1906,6 +1999,12 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       },
                       itemBuilder: (_) => [
                         const PopupMenuItem(value: 'share', child: Text('Chia sẻ')),
+                        if (Platform.isAndroid && filesForBatch.isNotEmpty)
+                          const PopupMenuItem(value: 'vault', child: Text('Sao chép vào thư mục riêng tư')),
+                        if (filesForBatch.length >= 2)
+                          const PopupMenuItem(value: 'batchRename', child: Text('Đổi tên hàng loạt')),
+                        if (picked.any((path) => catOf(path)?.name == 'Âm thanh'))
+                          const PopupMenuItem(value: 'playlist', child: Text('Thêm vào playlist')),
                         const PopupMenuItem(value: 'zip', child: Text('Nén thành zip')),
                         if (sel.length == 1) const PopupMenuItem(value: 'ren', child: Text('Đổi tên')),
                         if (sel.length == 1) const PopupMenuItem(value: 'info', child: Text('Chi tiết')),
@@ -2071,12 +2170,13 @@ class PlayerPage extends StatelessWidget {
   final List<String> paths;
   final int index;
   final bool video;
-  const PlayerPage({super.key, required this.paths, required this.index, required this.video});
+  final bool? shuffle;
+  const PlayerPage({super.key, required this.paths, required this.index, required this.video, this.shuffle});
 
   @override
   Widget build(BuildContext context) => Platform.isAndroid
       ? AndroidMediaPage(
-          playback: mediaPlayback, paths: paths, index: index, video: video,
+          playback: mediaPlayback, paths: paths, index: index, video: video, shuffle: shuffle,
           oldPositions: video ? getResume() : const {}, openExternal: openExternal, share: shareFiles,
         )
       : _InlinePlayerPage(paths: paths, index: index, video: video);
