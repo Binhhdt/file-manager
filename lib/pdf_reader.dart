@@ -61,19 +61,9 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   PdfTextSearcher? _search;
   late final _key = 'pdf.${sha256.convert(utf8.encode(widget.source))}';
   late final _initial = app.prefs.getInt('$_key.page') ?? 1;
-  late final _document = PdfDocumentRefByLoader((_) async {
-    Pdfrx.cacheDirectoryPath ??= Directory.systemTemp.path;
-    await pdfrxFlutterInitialize().timeout(
-      const Duration(seconds: 25),
-      onTimeout: () =>
-          throw const FileSystemException('Trình đọc PDF không khởi động được'),
-    );
-    return PdfDocument.openFile(
-      widget.local,
-      passwordProvider: _password,
-      useProgressiveLoading: true,
-    );
-  }, key: PdfDocumentRefKey(widget.local));
+  PdfDocumentRefDirect? _document;
+  Object? _openError;
+  String _loading = 'Đang khởi động trình đọc PDF';
   late final _bookmarks = (app.prefs.getStringList('$_key.bookmarks') ?? [])
       .map(int.tryParse)
       .whereType<int>()
@@ -83,8 +73,57 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   int _page = 0, _pages = 0;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_open());
+    });
+  }
+
+  Future<void> _open() async {
+    try {
+      Pdfrx.cacheDirectoryPath ??= Directory.systemTemp.path;
+      await pdfrxFlutterInitialize().timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw const FileSystemException(
+            'Trình đọc PDF không khởi động được'),
+      );
+      if (!mounted) return;
+      setState(() => _loading = 'Đang đọc cấu trúc PDF');
+      // Limit the initial open without timing out a password dialog.
+      var expired = false;
+      final document =
+          await PdfDocument.openFile(widget.local).then((document) async {
+        if (expired) await document.dispose();
+        return document;
+      }).timeout(
+        const Duration(seconds: 15),
+        onTimeout: () {
+          expired = true;
+          throw const FileSystemException(
+              'Trình đọc không phản hồi khi đọc tệp PDF');
+        },
+      ).onError<PdfPasswordException>((_, __) {
+        if (!mounted) throw const FileSystemException('Đã đóng trình đọc PDF');
+        return PdfDocument.openFile(widget.local,
+            firstAttemptByEmptyPassword: false, passwordProvider: _password);
+      });
+      if (!mounted) {
+        await document.dispose();
+        return;
+      }
+      setState(
+          () => _document = PdfDocumentRefDirect(document, autoDispose: false));
+    } catch (error) {
+      if (mounted) setState(() => _openError = error);
+    }
+  }
+
+  @override
   void dispose() {
     _search?.dispose();
+    final document = _document;
+    if (document != null) unawaited(document.document.dispose());
     super.dispose();
   }
 
@@ -180,6 +219,8 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   @override
   Widget build(BuildContext context) {
     final search = _search;
+    final document = _document;
+    final error = _openError;
     return Theme(
       data: _dark
           ? ThemeData.dark(useMaterial3: true)
@@ -255,52 +296,71 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                   icon: const Icon(Icons.keyboard_arrow_down)),
             ]),
           Expanded(
-              child: PdfViewer(
-            _document,
-            controller: _controller,
-            initialPageNumber: _initial,
-            params: PdfViewerParams(
-              backgroundColor:
-                  _dark ? const Color(0xff232323) : const Color(0xffdddfe1),
-              maxImageBytesCachedOnMemory: 48 * 1024 * 1024,
-              verticalCacheExtent: 0.7,
-              horizontalCacheExtent: 0.3,
-              calculateInitialPageNumber: (document, _) => _initial.clamp(
-                  1, document.pages.isEmpty ? 1 : document.pages.length),
-              onViewerReady: (document, controller) {
-                if (!mounted || document.pages.isEmpty) return;
-                final initial = controller.pageNumber ??
-                    _initial.clamp(1, document.pages.length);
-                setState(() {
-                  _pages = document.pages.length;
-                  _page = initial;
-                  _search ??= PdfTextSearcher(controller);
-                });
-                unawaited(app.prefs.setInt('$_key.page', initial));
-              },
-              onPageChanged: _changed,
-              pagePaintCallbacks: [
-                if (search != null) search.pageTextMatchPaintCallback
-              ],
-              onGeneralTap: (_, __, details) {
-                if (details.type != PdfViewerGeneralTapType.doubleTap)
-                  return false;
-                unawaited(_controller.zoomUpOnLocalPosition(
-                    loop: true, localPosition: details.localPosition));
-                return true;
-              },
-              loadingBannerBuilder: (_, __, ___) => const Center(
-                child: CircularProgressIndicator(semanticsLabel: 'Đang mở PDF'),
-              ),
-              errorBannerBuilder: (_, error, __, ___) => Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text('Không mở được PDF. ${storageError(error)}',
-                      textAlign: TextAlign.center),
-                ),
-              ),
-            ),
-          )),
+              child: document == null
+                  ? Center(
+                      child: error == null
+                          ? CircularProgressIndicator(semanticsLabel: _loading)
+                          : Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Text(
+                                  'Không mở được PDF. ${storageError(error)}',
+                                  textAlign: TextAlign.center),
+                            ),
+                    )
+                  : PdfViewer(
+                      document,
+                      controller: _controller,
+                      initialPageNumber: _initial,
+                      params: PdfViewerParams(
+                        backgroundColor: _dark
+                            ? const Color(0xff232323)
+                            : const Color(0xffdddfe1),
+                        maxImageBytesCachedOnMemory: 48 * 1024 * 1024,
+                        verticalCacheExtent: 0.7,
+                        horizontalCacheExtent: 0.3,
+                        calculateInitialPageNumber: (document, _) =>
+                            _initial.clamp(
+                                1,
+                                document.pages.isEmpty
+                                    ? 1
+                                    : document.pages.length),
+                        onViewerReady: (document, controller) {
+                          if (!mounted || document.pages.isEmpty) return;
+                          final initial = controller.pageNumber ??
+                              _initial.clamp(1, document.pages.length);
+                          setState(() {
+                            _pages = document.pages.length;
+                            _page = initial;
+                            _search ??= PdfTextSearcher(controller);
+                          });
+                          unawaited(app.prefs.setInt('$_key.page', initial));
+                        },
+                        onPageChanged: _changed,
+                        pagePaintCallbacks: [
+                          if (search != null) search.pageTextMatchPaintCallback
+                        ],
+                        onGeneralTap: (_, __, details) {
+                          if (details.type != PdfViewerGeneralTapType.doubleTap)
+                            return false;
+                          unawaited(_controller.zoomUpOnLocalPosition(
+                              loop: true,
+                              localPosition: details.localPosition));
+                          return true;
+                        },
+                        loadingBannerBuilder: (_, __, ___) => const Center(
+                          child: CircularProgressIndicator(
+                              semanticsLabel: 'Đang mở PDF'),
+                        ),
+                        errorBannerBuilder: (_, error, __, ___) => Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Text(
+                                'Không mở được PDF. ${storageError(error)}',
+                                textAlign: TextAlign.center),
+                          ),
+                        ),
+                      ),
+                    )),
           if (_pages > 0)
             SafeArea(
               top: false,
