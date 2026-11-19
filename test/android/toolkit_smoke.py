@@ -51,7 +51,8 @@ def hierarchy():
 def node(label):
     for item in hierarchy():
         text = item.get("text", "") + " " + item.get("content-desc", "")
-        if label in text and item.get("package") == PACKAGE:
+        if (label in text and item.get("package") == PACKAGE
+                and not item.get("class", "").endswith("EditText")):
             xy = list(map(int, re.findall(r"\d+", item.get("bounds", ""))))
             if len(xy) == 4 and xy[2] > xy[0] and xy[3] > xy[1]:
                 return xy
@@ -147,6 +148,7 @@ def extract(filename, member, content=None, supplied=None, inspect_password=Fals
         password(supplied)
     if select:
         tap("nested")
+        tap("keep.txt")
     tap("Giải nén đã chọn" if select else "Giải nén toàn bộ")
     tap("Thư mục chứa tập tin nén")
     tap("Giải nén vào thư mục cùng tên tại đây")
@@ -154,6 +156,8 @@ def extract(filename, member, content=None, supplied=None, inspect_password=Fals
         password(supplied)
     target = f"{SAMPLES}/{filename.rsplit('.', 1)[0]}/{member}"
     wait(target, lambda: has_file(target, content), seconds=45)
+    if select:
+        assert not has_file(f"{SAMPLES}/{filename.rsplit('.', 1)[0]}/skip.txt")
     print(f"PASS extracted {filename}", flush=True)
 
 
@@ -176,7 +180,7 @@ def main():
     key("KEYCODE_WAKEUP")
     key("KEYCODE_MENU")
 
-    extract("fmkit-zip.zip", "nested/keep.txt", "zip fixture")
+    extract("fmkit-zip.zip", "nested/keep.txt", "zip fixture", select=True)
     extract("fmkit-tar.tgz", "target.txt", "tar fixture")
     extract("fmkit-rar4.rar", "testdir/test.txt", "test text file")
     extract("fmkit-rar5.rar", "helloworld.txt", "hello libarchive")
