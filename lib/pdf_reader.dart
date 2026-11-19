@@ -58,9 +58,22 @@ class PdfReaderPage extends StatefulWidget {
 
 class _PdfReaderPageState extends State<PdfReaderPage> {
   final _controller = PdfViewerController();
-  late final _search = PdfTextSearchSession(_controller, contextLength: 10);
+  late final _search = PdfTextSearcher(_controller);
   late final _key = 'pdf.${sha256.convert(utf8.encode(widget.source))}';
   late final _initial = app.prefs.getInt('$_key.page') ?? 1;
+  late final _document = PdfDocumentRefByLoader((_) async {
+    Pdfrx.cacheDirectoryPath ??= Directory.systemTemp.path;
+    await pdfrxFlutterInitialize().timeout(
+      const Duration(seconds: 25),
+      onTimeout: () =>
+          throw const FileSystemException('Trình đọc PDF không khởi động được'),
+    );
+    return PdfDocument.openFile(
+      widget.local,
+      passwordProvider: _password,
+      useProgressiveLoading: true,
+    );
+  }, key: PdfDocumentRefKey(widget.local));
   late final _bookmarks = (app.prefs.getStringList('$_key.bookmarks') ?? [])
       .map(int.tryParse)
       .whereType<int>()
@@ -222,7 +235,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                       labelText: 'Từ khóa trong tài liệu'),
                   onChanged: (value) => value.trim().isEmpty
                       ? _search.resetTextSearch()
-                      : _search.startTextSearch(value, startPageNumber: _page),
+                      : _search.startTextSearch(value),
                 ),
               )),
               AnimatedBuilder(
@@ -241,10 +254,9 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                   icon: const Icon(Icons.keyboard_arrow_down)),
             ]),
           Expanded(
-              child: PdfViewer.file(
-            widget.local,
+              child: PdfViewer(
+            _document,
             controller: _controller,
-            passwordProvider: _password,
             initialPageNumber: _initial,
             params: PdfViewerParams(
               backgroundColor:
@@ -269,8 +281,8 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
               onGeneralTap: (_, __, details) {
                 if (details.type != PdfViewerGeneralTapType.doubleTap)
                   return false;
-                unawaited(_controller.zoomUp(
-                    loop: true, zoomCenter: details.localPosition));
+                unawaited(_controller.zoomUpOnLocalPosition(
+                    loop: true, localPosition: details.localPosition));
                 return true;
               },
               loadingBannerBuilder: (_, __, ___) => const Center(

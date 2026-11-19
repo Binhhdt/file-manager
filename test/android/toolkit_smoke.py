@@ -224,5 +224,6 @@ if __name__ == "__main__":
     except Exception:
         adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-toolkit-ui.xml", okay=False)
         print(adb("exec-out", "cat", "/data/local/tmp/fm-toolkit-ui.xml", okay=False), flush=True)
-        print(adb("logcat", "-d", "-t", "280", okay=False), flush=True)
+        print(adb("logcat", "-d", "-s", "flutter", "AndroidRuntime", okay=False), flush=True)
+        print(adb("logcat", "-d", "-t", "220", okay=False), flush=True)
         raise
