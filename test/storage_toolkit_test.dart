@@ -175,8 +175,9 @@ void main() {
         .where((entry) => entry.path.endsWith('.fmv'))
         .cast<File>()
         .single;
-    expect(await encrypted.readAsString(encoding: latin1),
-        isNot(contains('Tên riêng tư')));
+    final ciphertext = await encrypted.readAsBytes();
+    expect(utf8.decode(ciphertext, allowMalformed: true),
+        isNot(contains('Tên riêng tư.txt')));
     expect(await original.length(), contents.length);
     vault.lock();
     expect(vault.unlocked, isFalse);
