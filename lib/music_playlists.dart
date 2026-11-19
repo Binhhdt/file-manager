@@ -409,6 +409,7 @@ class _PlaylistPageState extends State<_PlaylistPage> {
   final _durations = <String, int>{};
   final _missing = <String>{};
   bool _busy = false;
+  int _metadataRequest = 0;
 
   Future<void> _locate(SavedPlaylist item, String oldPath) async {
     final path = await Navigator.push<String>(
@@ -440,27 +441,29 @@ class _PlaylistPageState extends State<_PlaylistPage> {
   }
 
   Future<void> _metadata() async {
+    final requestId = ++_metadataRequest;
     final items = app.playlists.find(widget.id)?.songs ?? const <String>[];
     for (final path in items) {
-      if (!mounted) return;
+      if (!mounted || requestId != _metadataRequest) return;
       var duration = 0;
-      bool missing = false;
+      StorageEntry? stat;
       try {
-        final stat = await app.storage.stat(path);
-        if (stat?.isFile == true) {
-          final request = app.thumbnails.request(stat!, 'audio');
-          try {
-            duration = (await request.result).duration;
-          } finally {
-            request.cancel();
-          }
-        } else {
-          missing = true;
-        }
+        stat = await app.storage.stat(path);
       } catch (_) {
-        missing = true;
+        // The path remains in the playlist when a mount is offline.
       }
-      if (mounted)
+      final missing = stat?.isFile != true;
+      if (!missing) {
+        final request = app.thumbnails.request(stat!, 'audio');
+        try {
+          duration = (await request.result).duration;
+        } on Exception {
+          // Missing duration does not make a readable track unavailable.
+        } finally {
+          request.cancel();
+        }
+      }
+      if (mounted && requestId == _metadataRequest)
         setState(() {
           _durations[path] = duration;
           missing ? _missing.add(path) : _missing.remove(path);
@@ -480,21 +483,29 @@ class _PlaylistPageState extends State<_PlaylistPage> {
     setState(() => _busy = true);
     try {
       final playable = <String>[];
+      final unavailable = <String>{};
       final job = app.Job();
       await app.runJob(context, 'Đang kiểm tra playlist', job, () async {
         for (final path in item.songs) {
           job.check();
           job.describe(storageDisplayPath(path));
           try {
-            if ((await app.storage.stat(path))?.isFile == true)
+            if ((await app.storage.stat(path))?.isFile == true) {
               playable.add(path);
+            } else {
+              unavailable.add(path);
+            }
           } on Exception {
-            // An offline mount is skipped for this playback only.
+            unavailable.add(path);
           }
         }
       });
       job.check();
       if (!mounted) return;
+      _metadataRequest++;
+      setState(() => _missing
+        ..removeAll(playable)
+        ..addAll(unavailable));
       if (playable.isEmpty)
         throw const FileSystemException('Không có bài nào đọc được');
       if (playable.length < item.songs.length)
@@ -519,6 +530,7 @@ class _PlaylistPageState extends State<_PlaylistPage> {
       _error(error);
     } finally {
       if (mounted) setState(() => _busy = false);
+      if (mounted) unawaited(_metadata());
     }
   }
 
