@@ -61,9 +61,10 @@ VaultDeviceEnvelope _testEnvelope(int device) {
     if (seal)
       return (await cipher.encrypt(data, secretKey: key)).concatenation();
     return Uint8List.fromList(await cipher.decrypt(
-        SecretBox.fromConcatenation(data,
-            nonceLength: cipher.nonceLength, macLength: 16),
-        secretKey: key));
+            SecretBox.fromConcatenation(data,
+                nonceLength: cipher.nonceLength, macLength: 16),
+            secretKey: key))
+        .asUnmodifiableView();
   };
 }
 

@@ -58,7 +58,14 @@ def bounds(item):
 
 
 def node(label, *, exact=False, clickable=False):
-    for item in hierarchy():
+    items = hierarchy()
+    if any(item.get("text", "") in ("Messenger has stopped", "Messenger keeps stopping") for item in items):
+        for item in items:
+            if item.get("text") in ("Close app", "OK") and (xy := bounds(item)):
+                x1, y1, x2, y2 = xy
+                adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+                return None
+    for item in items:
         text = (item.get("text", "") + " " + item.get("content-desc", "")).strip()
         if ((text == label if exact else label in text) and item.get("package") == PACKAGE
                 and (not clickable or item.get("clickable") == "true")

@@ -167,8 +167,8 @@ class VaultStore {
         throw const FileSystemException(
             'Cần khóa Android Keystore của thiết bị này');
       }
-      final data =
-          await envelope(base64Decode(row['device'] as String), seal: false);
+      final data = Uint8List.fromList(
+          await envelope(base64Decode(row['device'] as String), seal: false));
       try {
         row = jsonDecode(utf8.decode(data));
       } finally {
@@ -201,11 +201,11 @@ class VaultStore {
         overwriteWhenDestroyed: true);
     derived.fillRange(0, derived.length, 0);
     try {
-      return await _cipher.decrypt(
+      return Uint8List.fromList(await _cipher.decrypt(
           SecretBox.fromConcatenation(wrapped,
               nonceLength: _cipher.nonceLength, macLength: _tagSize),
           secretKey: passKey,
-          aad: utf8.encode('$_version:master'));
+          aad: utf8.encode('$_version:master')));
     } on SecretBoxAuthenticationError {
       throw const FileSystemException('Sai mật khẩu hoặc cấu hình đã hỏng');
     } finally {
@@ -695,7 +695,7 @@ class VaultStore {
     }
     final key =
         await _key(item.id, item.ancestors.isEmpty ? '' : item.ancestors.last);
-    final bytes = BytesBuilder(copy: false);
+    final bytes = BytesBuilder();
     try {
       final actual = await _readFile(
           _object(item.id, _location(item.ancestors)), item.id, key, progress,
