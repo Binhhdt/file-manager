@@ -357,6 +357,113 @@ Future<String?> prompt(BuildContext context, String title, String init) {
   );
 }
 
+class _RenameDialog extends StatefulWidget {
+  final String name;
+  final bool isDirectory;
+
+  const _RenameDialog({required this.name, required this.isDirectory});
+
+  @override
+  State<_RenameDialog> createState() => _RenameDialogState();
+}
+
+class _RenameDialogState extends State<_RenameDialog> {
+  static final _invalidCharacters = RegExp(r'[/\x00-\x1f\x7f]');
+
+  late final _suffix = widget.isDirectory ? '' : p.extension(widget.name);
+  late final _extension = _suffix == '.' ? '' : _suffix;
+  late final _nameController = TextEditingController.fromValue(TextEditingValue(
+    text: widget.name,
+    selection: TextSelection(
+      baseOffset: 0,
+      extentOffset: widget.name.length - _extension.length,
+    ),
+  ));
+  final _focus = FocusNode();
+  bool _extensionEdited = false;
+  String? _error;
+
+  TextEditingValue _trackExtension(
+      TextEditingValue before, TextEditingValue after) {
+    if (_extension.isNotEmpty && before.text != after.text) {
+      _extensionEdited |= !after.text.endsWith(_extension) ||
+          before.selection.end > before.text.length - _extension.length;
+    }
+    return after;
+  }
+
+  void _submit() {
+    final text = _nameController.text;
+    final keepsExtension = _extension.isNotEmpty && !_extensionEdited;
+    var stem = keepsExtension
+        ? text.substring(0, text.length - _extension.length)
+        : text;
+    final extension = _extension.toLowerCase();
+    // Pasting a full filename over the selected stem can leave the old
+    // extension twice. Keep a deliberate full-name edit or an existing suffix.
+    if (keepsExtension &&
+        stem.length >= _extension.length &&
+        stem.toLowerCase().endsWith(extension) &&
+        !widget.name.toLowerCase().endsWith('$extension$extension')) {
+      stem = stem.substring(0, stem.length - _extension.length);
+    }
+    final name = keepsExtension ? stem + _extension : stem;
+    if (stem.trim().isEmpty ||
+        name == '.' ||
+        name == '..' ||
+        _invalidCharacters.hasMatch(name) ||
+        privateStorageName(name)) {
+      setState(() => _error = 'Tên không hợp lệ');
+      return;
+    }
+    Navigator.pop(context, name);
+  }
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Đổi tên'),
+        scrollable: true,
+        content: TextField(
+          controller: _nameController,
+          focusNode: _focus,
+          autofocus: true,
+          selectAllOnFocus: false,
+          minLines: 1,
+          maxLines: 8,
+          keyboardType: TextInputType.text,
+          textInputAction: TextInputAction.done,
+          decoration: InputDecoration(errorText: _error),
+          inputFormatters: [TextInputFormatter.withFunction(_trackExtension)],
+          onChanged: (_) {
+            if (_error != null) setState(() => _error = null);
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              _focus.requestFocus();
+              _nameController.selection = TextSelection(
+                baseOffset: 0,
+                extentOffset: _nameController.text.length,
+              );
+            },
+            child: const Text('Chọn toàn bộ'),
+          ),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Huỷ')),
+          FilledButton(onPressed: _submit, child: const Text('OK')),
+        ],
+      );
+}
+
 Future<bool> confirm(BuildContext context, String title, String msg, String ok) async {
   final r = await showDialog<bool>(
     context: context,
@@ -1281,11 +1388,19 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
     }), 'Đã tạo tập tin');
   }
 
-  Future<void> _rename(String path) async {
-    final s = await prompt(context, 'Đổi tên', p.basename(path));
-    if (_badName(s) || s == p.basename(path)) return;
-    final dest = p.join(p.dirname(path), s!);
+  Future<void> _rename(Item item) async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => _RenameDialog(name: item.name, isDirectory: item.isDir),
+    );
+    if (!mounted || name == null || name == item.name) return;
+    final path = item.e.path;
+    final dest = p.join(p.dirname(path), name);
     await _run(() async {
+      await storage.available(path);
+      if (await storage.stat(dest) != null) {
+        throw FileSystemException('Tên đã tồn tại', dest);
+      }
       await operations.move(path, dest, fast: true);
       catalog.markPath(path);
       catalog.markPath(dest);
@@ -1544,7 +1659,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
               if (!it.isDir) o(Icons.share, 'Chia sẻ', () => shareFiles(context, [path])),
               if (!isSaf(path) && isArchive(path)) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
               if (!isSaf(path)) o(Icons.archive, 'Nén thành zip', () => _zip([path])),
-              o(Icons.edit, 'Đổi tên', () => _rename(path)),
+              o(Icons.edit, 'Đổi tên', () => _rename(it)),
               if (clip.value == null) o(Icons.copy, 'Sao chép', () => _toClip([path], false)),
               if (clip.value == null) o(Icons.drive_file_move, 'Di chuyển', () => _toClip([path], true)),
               if (it.isDir)
@@ -1779,7 +1894,8 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                     PopupMenuButton<String>(
                       onSelected: (v) {
                         if (v == 'ren') {
-                          _rename(picked.first);
+                          final index = _positions[picked.first];
+                          if (index != null) _rename(items[index]);
                         } else if (v == 'info') {
                           _info(one());
                         } else if (v == 'share') {
