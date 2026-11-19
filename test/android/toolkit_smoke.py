@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -128,6 +129,8 @@ def fixtures(folder):
     (folder / "fmkit-plain.7z").write_bytes(fetch(COMPRESS + "bla.7z"))
     (folder / "fmkit-seven.7z").write_bytes(fetch(COMPRESS + "bla.encrypted.7z"))
     make_pdf(folder / "fmkit-document.pdf")
+    shutil.copyfile(Path(__file__).with_name("fixtures") / "encrypted-two-pages.pdf",
+                    folder / "fmkit-locked.pdf")
 
 
 def password(value):
@@ -216,6 +219,18 @@ def main():
     open_sample("fmkit-document.pdf")
     wait("remembered PDF page", lambda: node("2 / 2"))
     print("PASS PDF rendering, navigation, text search and remembered page", flush=True)
+
+    open_sample("fmkit-locked.pdf")
+    wait("PDF password prompt", lambda: node("Mật khẩu PDF"))
+    adb("shell", "input", "text", "bad-password")
+    tap("Mở")
+    # The first dialog closes before the reader opens another for a new attempt.
+    time.sleep(1)
+    wait("PDF password prompt after a wrong password", lambda: node("Mật khẩu PDF"))
+    adb("shell", "input", "text", "test-password")
+    tap("Mở")
+    wait("encrypted PDF first page", lambda: node("1 / 2"))
+    print("PASS PDF password prompt, wrong-password retry and opening", flush=True)
 
 
 if __name__ == "__main__":

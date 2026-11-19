@@ -43,7 +43,7 @@ def key(name):
     adb("shell", "input", "keyevent", name)
 
 
-def tap(label):
+def tap(label, *, hold=False):
     def bounds():
         adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
         result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
@@ -65,7 +65,11 @@ def tap(label):
         return None
 
     x1, y1, x2, y2 = wait(f"UI {label}", bounds, seconds=45)
-    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    x, y = str((x1 + x2) // 2), str((y1 + y2) // 2)
+    if hold:
+        adb("shell", "input", "swipe", x, y, x, y, "850")
+    else:
+        adb("shell", "input", "tap", x, y)
     print(f"Tapped {label}", flush=True)
 
 
@@ -246,6 +250,29 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         wait("foreground media service stopped", lambda: "isForeground=true" not in
              adb("shell", "dumpsys", "activity", "services", PACKAGE))
         print("PASS explicit stop releases foreground playback", flush=True)
+
+        adb("shell", "am", "force-stop", PACKAGE)
+        foreground()
+        search("fm-")
+        tap("01-fm-second.mp3", hold=True)
+        tap("02-fm-third.mp3")
+        tap("Show menu")
+        tap("Thêm vào playlist")
+        tap("Tạo playlist mới")
+        adb("shell", "input", "text", "ToolkitSmokePlaylist")
+        tap("OK")
+        tap("Đã cập nhật playlist.")
+
+        adb("shell", "am", "force-stop", PACKAGE)
+        foreground()
+        adb("shell", "input", "swipe", "410", "1320", "410", "520", "350")
+        tap("Playlist nhạc")
+        tap("ToolkitSmokePlaylist")
+        tap("01-fm-second.mp3")
+        wait("first saved playlist track", lambda: session("01-fm-second"))
+        command("next")
+        wait("remaining saved playlist track", lambda: session("02-fm-third"))
+        print("PASS saved playlist persisted over restart and uses the existing media session", flush=True)
     except Exception:
         adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
         print("Latest hierarchy:", adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml", check=False), flush=True)
