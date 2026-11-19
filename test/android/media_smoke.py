@@ -43,14 +43,17 @@ def key(name):
     adb("shell", "input", "keyevent", name)
 
 
+def hierarchy():
+    adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
+    result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
+    if "dumped to" not in result:
+        return []
+    return list(ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml")).iter("node"))
+
+
 def tap(label, *, hold=False):
     def bounds():
-        adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
-        result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
-        if "dumped to" not in result:
-            return None
-        root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
-        for node in root.iter("node"):
+        for node in hierarchy():
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
             dismiss = text.strip() == "Got it" and node.get("package") == "com.android.systemui"
             if label not in text and not dismiss:
@@ -103,7 +106,22 @@ def command(action):
 
 def search(query):
     tap("Tìm kiếm")
-    adb("shell", "input", "text", query)
+    def field():
+        return next((node for node in hierarchy() if node.get("package") == PACKAGE
+                     and node.get("class", "").endswith("EditText")
+                     and node.get("focused") == "true"), None)
+
+    current = wait("focused search field", field).get("text", "")
+    for _ in range(3):
+        if current == query:
+            break
+        if current and current != "Tìm tập tin, thư mục":
+            key("KEYCODE_MOVE_END")
+            adb("shell", "input", "keyevent", *(["KEYCODE_DEL"] * len(current)))
+        adb("shell", "input", "text", query)
+        current = wait("search field after typing", field).get("text", "")
+    if current != query:
+        raise AssertionError(f"Expected search {query!r}, received {current!r}")
     key("KEYCODE_ENTER")
 
 
