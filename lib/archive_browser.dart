@@ -123,7 +123,7 @@ class _ArchivePageState extends State<_ArchivePage> {
         'password': _password,
         if (output != null) 'destination': output.path,
         if (entries != null)
-          'indices': entries.map((entry) => entry.index).toList(),
+          'entries': entries.map((entry) => entry.path).toList(),
       });
     } on PlatformException catch (error) {
       if (error.code == 'cancel') throw TransferCancelled();

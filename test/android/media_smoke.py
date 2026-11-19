@@ -200,9 +200,15 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         key("KEYCODE_WAKEUP")
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
-        command("stop")
-        wait("foreground audio service stopped", lambda: "isForeground=true" not in
-             adb("shell", "dumpsys", "activity", "services", PACKAGE))
+        foreground()
+
+        def stop_audio_service():
+            if "isForeground=true" not in adb("shell", "dumpsys", "activity", "services", PACKAGE):
+                return True
+            command("stop")
+            return False
+
+        wait("foreground audio service stopped", stop_audio_service)
         # Isolate video UI assertions from Telecom and keyguard focus changes.
         adb("shell", "am", "force-stop", PACKAGE)
         foreground()

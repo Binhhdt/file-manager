@@ -1,6 +1,7 @@
 package com.fmdemo.file_manager
 
 import android.app.Activity
+import android.os.Build
 import android.os.StatFs
 import android.os.SystemClock
 import io.flutter.plugin.common.BinaryMessenger
@@ -8,6 +9,7 @@ import io.flutter.plugin.common.MethodChannel
 import me.zhanghai.android.libarchive.Archive
 import me.zhanghai.android.libarchive.ArchiveEntry
 import org.apache.commons.compress.archivers.sevenz.SevenZFile
+import org.apache.commons.compress.archivers.sevenz.SevenZMethod
 import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
@@ -61,7 +63,7 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
                             attempt.name.startsWith("extract-") && output.name == "output" &&
                             output.isDirectory && output.list()?.isEmpty() == true)
                     }
-                    val selected = call.argument<List<Int>>("indices")?.toSet()
+                    val selected = call.argument<List<String>>("entries")?.toSet()
                     val details = inspect(path, password, destination, selected, cancel) { count ->
                         activity.runOnUiThread { channel.invokeMethod("progress", mapOf("id" to id, "bytes" to count)) }
                     }
@@ -106,7 +108,7 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
         init {
             try {
                 for (format in intArrayOf(Archive.FORMAT_ZIP, Archive.FORMAT_TAR,
-                    Archive.FORMAT_RAR, Archive.FORMAT_RAR_V5)) {
+                    Archive.FORMAT_RAR, Archive.FORMAT_RAR_V5, Archive.FORMAT_7ZIP)) {
                     Archive.readSupportFormatByCode(handle, format)
                 }
                 Archive.readSupportFilterByCode(handle, Archive.FILTER_NONE)
@@ -155,6 +157,7 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
             val mode = (attrs ushr 16) and 0xF000
             return Entry(item.name ?: throw IOException("Tên trong tập tin 7Z bị lỗi"),
                 item.size, item.isDirectory,
+                encrypted = item.contentMethods?.any { it.method == SevenZMethod.AES256SHA256 } == true,
                 link = item.isAntiItem || (attrs and 0x400) != 0 ||
                     mode !in setOf(0, 0x4000, 0x8000))
         }
@@ -182,21 +185,27 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
         return name
     }
 
-    private fun inspect(path: File, password: String?, folder: File?, indices: Set<Int>?,
+    private fun inspect(path: File, password: String?, folder: File?, selected: Set<String>?,
         cancelled: AtomicBoolean, update: (Long) -> Unit): List<Map<String, Any>> {
         val limit = 32L * 1024 * 1024 * 1024
         val space = folder?.let { StatFs(it.path).availableBytes }
         val facts = ArrayList<Map<String, Any>>()
         val seen = HashMap<String, Boolean>()
         val bytes = ByteArray(128 * 1024)
-        val source: Reader = if (path.extension.equals("7z", true)) {
+        val seven = path.extension.equals("7z", true)
+        // Use libarchive for unencrypted extraction on older Android, where
+        // Commons Compress can fail integrity checks even on valid 7Z entries.
+        // The chooser submits validated path names so either reader extracts
+        // the same selections even if their entry ordering differs.
+        val legacyPlainSeven = Build.VERSION.SDK_INT < 26 && folder != null && password == null
+        val source: Reader = if (seven && !legacyPlainSeven) {
             SevenReader(path, password)
         } else NativeReader(path, password)
         var written = 0L
         var declared = 0L
         var last = 0L
         var index = 0
-        var completed = 0
+        val completed = HashSet<String>()
         var pathCharacters = 0
         source.use { reader ->
             while (true) {
@@ -227,7 +236,7 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
                         "directory" to entry.directory, "encrypted" to entry.encrypted))
                     continue
                 }
-                if (indices != null && number !in indices) continue
+                if (selected != null && name !in selected) continue
                 val output = File(folder, name)
                 if (entry.directory) {
                     if (!output.isDirectory && !output.mkdirs()) throw IOException("Không tạo được thư mục $name")
@@ -263,11 +272,11 @@ internal class ArchiveBridge(private val activity: Activity, messenger: BinaryMe
                     }
                     if (entry.size >= 0 && count != entry.size) throw IOException("Tập tin nén thiếu dữ liệu: $name")
                 }
-                completed++
+                completed.add(name)
             }
         }
         if (folder != null) {
-            if (completed == 0 || (indices != null && completed != indices.size)) {
+            if (completed.isEmpty() || (selected != null && completed != selected)) {
                 throw IOException("Danh sách tập tin nén đã thay đổi")
             }
             update(written)
