@@ -107,7 +107,7 @@ def command(action):
 def search(query):
     tap("Tìm kiếm")
     def field():
-        return next((node for node in hierarchy() if node.get("package") == PACKAGE
+        return next((node.attrib for node in hierarchy() if node.get("package") == PACKAGE
                      and node.get("class", "").endswith("EditText")
                      and node.get("focused") == "true"), None)
 
