@@ -8,6 +8,10 @@ on:
         description: Kiem thu media tren Android Emulator sau khi build
         type: boolean
         default: false
+      android_toolkit_smoke:
+        description: Kiem thu tap tin nen va PDF tren Android Emulator
+        type: boolean
+        default: false
       media_smoke_apk_run:
         description: Run ID cua APK da build de chay lai kiem thu
         type: string
@@ -58,11 +62,26 @@ jobs:
           sed -i '0,/<application/s##<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/><application android:requestLegacyExternalStorage="true"#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quản lý tập tin"#' $M
           python3 android_src/configure_media.py
+          python3 android_src/configure_vault.py
+          mkdir -p android/app/src/main/assets/notices
+          cp android_src/licenses/*.txt android/app/src/main/assets/notices/
+          cat >> android/app/build.gradle.kts <<'EOF'
+          android {
+              compileOptions.isCoreLibraryDesugaringEnabled = true
+              packaging.resources.merges += setOf("META-INF/LICENSE.txt", "META-INF/NOTICE.txt")
+          }
+          dependencies {
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
+              implementation("me.zhanghai.android.libarchive:library:1.1.6")
+              implementation("org.apache.commons:commons-compress:1.28.0")
+              implementation("org.tukaani:xz:1.12")
+          }
+          EOF
           cat $M
       - name: Ma Android goc va icon ung dung
         run: |
           K=$(find android/app/src/main -name MainActivity.kt)
-          cp android_src/StorageBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt "$(dirname "$K")/"
+          cp android_src/StorageBridge.kt android_src/ArchiveBridge.kt android_src/MediaBridge.kt android_src/MediaPlaybackService.kt android_src/VaultDeviceKey.kt "$(dirname "$K")/"
           cat > "$K" <<'EOF'
           package com.fmdemo.file_manager
 
@@ -90,6 +109,7 @@ jobs:
           @UnstableApi
           class MainActivity : FlutterActivity() {
               private var storage: StorageBridge? = null
+              private var archives: ArchiveBridge? = null
               private var media: MediaBridge? = null
 
               override fun onStart() {
@@ -117,6 +137,8 @@ jobs:
               override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
                   media?.close()
                   media = null
+                  archives?.close()
+                  archives = null
                   storage?.close()
                   storage = null
                   super.cleanUpFlutterEngine(flutterEngine)
@@ -223,9 +245,40 @@ jobs:
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   storage = StorageBridge(this, flutterEngine.dartExecutor.binaryMessenger)
+                  archives = ArchiveBridge(this, flutterEngine.dartExecutor.binaryMessenger)
                   media = MediaBridge(this, flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "fm/native").setMethodCallHandler { call, result ->
                       val method = call.method
+                      if (method == "vaultSeal" || method == "vaultUnseal") {
+                          val input = call.argument<ByteArray>("data")
+                          if (input == null) {
+                              result.error("vaultKey", "Thiếu dữ liệu cấu hình kho", null)
+                              return@setMethodCallHandler
+                          }
+                          Thread {
+                              try {
+                                  val output = if (method == "vaultSeal") VaultDeviceKey.seal(input)
+                                      else VaultDeviceKey.unseal(input)
+                                  runOnUiThread { result.success(output) }
+                              } catch (_: Exception) {
+                                  runOnUiThread {
+                                      result.error("vaultKey", "Không truy cập được khóa kho trong Android Keystore. Có thể phục hồi từ bản sao đã mã hóa.", null)
+                                  }
+                              } finally {
+                                  input.fill(0)
+                              }
+                          }.start()
+                          return@setMethodCallHandler
+                      }
+                      if (method == "vaultScreen") {
+                          if (call.argument<String>("src") == "1") {
+                              window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                          } else {
+                              window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                          }
+                          result.success(null)
+                          return@setMethodCallHandler
+                      }
                   if (method == "keepOn") {
                       if (call.argument<String>("src") == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                       else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -321,7 +374,7 @@ jobs:
 
 
   media-smoke:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.android_media_smoke && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.media_smoke_apk_run != '')) }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.android_media_smoke || inputs.android_toolkit_smoke) && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.media_smoke_apk_run != '')) }}
     needs: build
     permissions:
       contents: read
@@ -340,6 +393,9 @@ jobs:
           path: smoke-apk
           github-token: ${{ github.token }}
           run-id: ${{ inputs.media_smoke_apk_run || github.run_id }}
+      - name: Inspect bundled PDFium libraries
+        if: inputs.android_toolkit_smoke
+        run: unzip -Z -1 smoke-apk/app-release.apk | awk '/pdfium|native_assets/ {print}'
       - name: Enable KVM for the Android emulator
         run: |
           printf 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\n' | sudo tee /etc/udev/rules.d/99-kvm-emulator.rules
@@ -355,6 +411,8 @@ jobs:
       - uses: reactivecircus/android-emulator-runner@v2
         env:
           FM_SMOKE_APK: smoke-apk/app-release.apk
+          FM_MEDIA_SMOKE: ${{ inputs.android_media_smoke }}
+          FM_TOOLKIT_SMOKE: ${{ inputs.android_toolkit_smoke }}
         with:
           api-level: ${{ matrix.api }}
           target: google_apis
@@ -362,4 +420,7 @@ jobs:
           disable-animations: true
           emulator-boot-timeout: 300
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
-          script: python3 -u test/android/media_smoke.py
+          script: |
+            set -e
+            if [ "$FM_TOOLKIT_SMOKE" = "true" ]; then python3 -u test/android/toolkit_smoke.py; fi
+            if [ "$FM_MEDIA_SMOKE" = "true" ]; then FM_SMOKE_ALREADY_INSTALLED="$FM_TOOLKIT_SMOKE" python3 -u test/android/media_smoke.py; fi

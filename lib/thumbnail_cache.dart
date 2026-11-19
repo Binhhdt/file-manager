@@ -206,6 +206,49 @@ class ThumbnailCache {
     _trimming = work;
     return work.whenComplete(() => _trimming = null);
   }
+
+  static final _cleanupName = RegExp(r'^[0-9a-f]{64}\.(img|json)(\.new)?$');
+
+  bool _canClean(String path, DateTime modified) {
+    final name = p.basename(path);
+    return p.dirname(path) == directory.path &&
+        _cleanupName.hasMatch(name) &&
+        !_jobs.containsKey(name.split('.').first) &&
+        (!name.endsWith('.new') ||
+            DateTime.now().difference(modified) > const Duration(days: 1));
+  }
+
+  Future<List<StorageEntry>> cleanupCandidates() async {
+    await _ready;
+    final found = <StorageEntry>[];
+    await for (final entry in directory.list(followLinks: false)) {
+      if (entry is! File) continue;
+      final stat = await entry.stat();
+      if (stat.type == FileSystemEntityType.file &&
+          _canClean(entry.path, stat.modified)) {
+        found.add(StorageEntry.local(entry.path, stat));
+      }
+    }
+    return found;
+  }
+
+  Future<int> removeCleanupCandidate(StorageEntry entry) async {
+    if (_trimming case final active?) await active;
+    // Check and unlink together before the Dart worker can start another job.
+    final type = FileSystemEntity.typeSync(entry.path, followLinks: false);
+    if (type == FileSystemEntityType.notFound) return 0;
+    final stat = FileStat.statSync(entry.path);
+    if (type != FileSystemEntityType.file ||
+        !_canClean(entry.path, stat.modified) ||
+        stat.size != entry.size ||
+        stat.modified != entry.modified ||
+        stat.changed.microsecondsSinceEpoch != entry.version) {
+      throw FileSystemException(
+          'Cache đã thay đổi hoặc đang được dùng', entry.path);
+    }
+    File(entry.path).deleteSync();
+    return stat.size;
+  }
 }
 
 Future<void> _trimOnWorker(

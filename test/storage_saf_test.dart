@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:file_manager/file_operations.dart';
 import 'package:file_manager/storage.dart';
 import 'package:file_manager/trash.dart';
+import 'package:file_manager/vault.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -84,6 +85,17 @@ class DocumentProvider {
   void checkWrite() {
     if (!writable) throw PlatformException(code: 'permission');
   }
+}
+
+class _VaultProgress implements TransferProgress {
+  @override
+  void add(int amount) {}
+  @override
+  void check() {}
+  @override
+  void describe(String text) {}
+  @override
+  void finishing() {}
 }
 
 void main() {
@@ -182,4 +194,48 @@ void main() {
     expect(await trash.list(), isEmpty);
     expect(device.streams, isEmpty);
   });
+
+  test(
+      'encrypted vault copies an SAF folder and recovers an authenticated backup after reconnect',
+      () async {
+    final storage = Storage();
+    final progress = _VaultProgress();
+    const password = 'Mật khẩu kho thử nghiệm';
+    final document = p.join(root, 'hồ sơ', 'Tài liệu.txt');
+    final original = File(device.pathOf(document));
+    await original.parent.create();
+    await original.writeAsString('nội dung từ thẻ');
+    final vault =
+        VaultStore(Directory(p.join(internal.path, 'vault')), storage);
+    addTearDown(vault.lock);
+    await vault.unlock(password, create: true);
+    await vault.importFile(p.dirname(document), progress);
+    expect(await original.readAsString(), 'nội dung từ thẻ');
+    final backup = await Directory(p.join(internal.path, 'backup')).create();
+    await vault.backupTo(backup, progress);
+    expect(
+        await operations
+            .paste([backup.path], root, move: false, conflict: Conflict.keep),
+        1);
+    final recoveredRoot = Directory(p.join(internal.path, 'recovered'));
+    final recovered = VaultStore(recoveredRoot, storage);
+    addTearDown(recovered.lock);
+    final backupPath = p.join(root, 'backup');
+    device.connected = false;
+    await expectLater(
+        recovered.restoreBackup(backupPath, password, progress),
+        throwsA(
+            isA<PlatformException>().having((e) => e.code, 'code', 'offline')));
+    expect(await recoveredRoot.exists(), isFalse);
+    device.connected = true;
+    await recovered.restoreBackup(backupPath, password, progress);
+    await recovered.unlock(password, create: false);
+    final (items, damaged) = await recovered.list(progress);
+    expect(damaged, 0);
+    final output = p.join(internal.path, 'decoded');
+    await recovered.exportTo(items.single, output, progress);
+    expect(await File(p.join(output, 'Tài liệu.txt')).readAsString(),
+        'nội dung từ thẻ');
+    expect(device.streams, isEmpty);
+  }, timeout: const Timeout(Duration(minutes: 2)));
 }

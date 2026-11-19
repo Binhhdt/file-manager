@@ -117,7 +117,7 @@ internal class MediaBridge(private val activity: Activity, engine: FlutterEngine
                     val requestPage = call.argument<Int>("view")
                     if (isVideo && requestPage != null && page != requestPage) return@withService null
                     val positions = call.argument<Map<String, Number>>("legacy").orEmpty().mapValues { it.value.toLong() }
-                    service.open(paths, index, isVideo, positions)
+                    service.open(paths, index, isVideo, positions, call.argument<Boolean>("shuffle"))
                     null
                 }
                 "restore" -> withService(reply) { it.restoreMusic() }

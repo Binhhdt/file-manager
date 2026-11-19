@@ -123,6 +123,12 @@ internal class StorageBridge(private val activity: Activity, messenger: BinaryMe
                         "privateDir" -> activity.filesDir.absolutePath
                         "available" -> { ensureAvailable(path()); null }
                         "identity" -> identity(path())
+                        "fileIdentity" -> try {
+                            val node = Os.lstat(path())
+                            "${node.st_dev}:${node.st_ino}"
+                        } catch (_: android.system.ErrnoException) {
+                            null
+                        }
                         "sameDevice" -> {
                             val from = path()
                             val to = requireNotNull(call.argument<String>("to"))

@@ -43,14 +43,17 @@ def key(name):
     adb("shell", "input", "keyevent", name)
 
 
-def tap(label):
+def hierarchy():
+    adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
+    result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
+    if "dumped to" not in result:
+        return []
+    return list(ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml")).iter("node"))
+
+
+def tap(label, *, hold=False):
     def bounds():
-        adb("shell", "rm", "-f", "/data/local/tmp/fm-ui.xml", check=False)
-        result = adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
-        if "dumped to" not in result:
-            return None
-        root = ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml"))
-        for node in root.iter("node"):
+        for node in hierarchy():
             text = " ".join((node.get("text", ""), node.get("content-desc", "")))
             dismiss = text.strip() == "Got it" and node.get("package") == "com.android.systemui"
             if label not in text and not dismiss:
@@ -65,7 +68,11 @@ def tap(label):
         return None
 
     x1, y1, x2, y2 = wait(f"UI {label}", bounds, seconds=45)
-    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    x, y = str((x1 + x2) // 2), str((y1 + y2) // 2)
+    if hold:
+        adb("shell", "input", "swipe", x, y, x, y, "850")
+    else:
+        adb("shell", "input", "tap", x, y)
     print(f"Tapped {label}", flush=True)
 
 
@@ -99,7 +106,22 @@ def command(action):
 
 def search(query):
     tap("Tìm kiếm")
-    adb("shell", "input", "text", query)
+    def field():
+        return next((node.attrib for node in hierarchy() if node.get("package") == PACKAGE
+                     and node.get("class", "").endswith("EditText")
+                     and node.get("focused") == "true"), None)
+
+    current = wait("focused search field", field).get("text", "")
+    for _ in range(3):
+        if current == query:
+            break
+        if current and current != "Tìm tập tin, thư mục":
+            key("KEYCODE_MOVE_END")
+            adb("shell", "input", "keyevent", *(["KEYCODE_DEL"] * len(current)))
+        adb("shell", "input", "text", query)
+        current = wait("search field after typing", field).get("text", "")
+    if current != query:
+        raise AssertionError(f"Expected search {query!r}, received {current!r}")
     key("KEYCODE_ENTER")
 
 
@@ -154,7 +176,9 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
     try:
         folder = Path(temp)
         fixtures(folder)
-        adb("install", "-r", "-g", os.environ["FM_SMOKE_APK"])
+        if os.environ.get("FM_SMOKE_ALREADY_INSTALLED") != "true":
+            run("adb", "install", "-r", "-g", os.environ["FM_SMOKE_APK"], timeout=90)
+        adb("shell", "am", "force-stop", PACKAGE)
         if version >= 30:
             adb("shell", "appops", "set", "--uid", PACKAGE, "MANAGE_EXTERNAL_STORAGE", "allow")
         adb("shell", "mkdir", "-p", "/sdcard/Download")
@@ -200,9 +224,15 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         key("KEYCODE_WAKEUP")
         adb("shell", "wm", "dismiss-keyguard", check=False)
         key("KEYCODE_MENU")
-        command("stop")
-        wait("foreground audio service stopped", lambda: "isForeground=true" not in
-             adb("shell", "dumpsys", "activity", "services", PACKAGE))
+        foreground()
+
+        def stop_audio_service():
+            if "isForeground=true" not in adb("shell", "dumpsys", "activity", "services", PACKAGE):
+                return True
+            command("stop")
+            return False
+
+        wait("foreground audio service stopped", stop_audio_service)
         # Isolate video UI assertions from Telecom and keyguard focus changes.
         adb("shell", "am", "force-stop", PACKAGE)
         foreground()
@@ -240,6 +270,29 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
         wait("foreground media service stopped", lambda: "isForeground=true" not in
              adb("shell", "dumpsys", "activity", "services", PACKAGE))
         print("PASS explicit stop releases foreground playback", flush=True)
+
+        adb("shell", "am", "force-stop", PACKAGE)
+        foreground()
+        search("fm-")
+        tap("01-fm-second.mp3", hold=True)
+        tap("02-fm-third.mp3")
+        tap("Show menu")
+        tap("Thêm vào playlist")
+        tap("Tạo playlist mới")
+        adb("shell", "input", "text", "ToolkitSmokePlaylist")
+        tap("OK")
+        tap("Đã cập nhật playlist.")
+
+        adb("shell", "am", "force-stop", PACKAGE)
+        foreground()
+        adb("shell", "input", "swipe", "410", "1320", "410", "520", "350")
+        tap("Playlist nhạc")
+        tap("ToolkitSmokePlaylist")
+        tap("01-fm-second.mp3")
+        wait("first saved playlist track", lambda: session("01-fm-second"))
+        command("next")
+        wait("remaining saved playlist track", lambda: session("02-fm-third"))
+        print("PASS saved playlist persisted over restart and uses the existing media session", flush=True)
     except Exception:
         adb("shell", "uiautomator", "dump", "/data/local/tmp/fm-ui.xml", check=False)
         print("Latest hierarchy:", adb("exec-out", "cat", "/data/local/tmp/fm-ui.xml", check=False), flush=True)

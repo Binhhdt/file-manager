@@ -116,13 +116,14 @@ class MediaPlayback extends ChangeNotifier {
 
   Future<void> open(
       List<String> paths, int index, bool video, Map<String, int> oldPositions,
-      {int? page}) {
+      {int? page, bool? shuffle}) {
     commandError = null;
     return command<void>('open', {
       'paths': paths,
       'index': index,
       'video': video,
       if (page != null) 'view': page,
+      if (shuffle != null) 'shuffle': shuffle,
       if (video) 'legacy': oldPositions,
     });
   }
@@ -269,6 +270,7 @@ class AndroidMediaPage extends StatefulWidget {
   final OpenMediaExternally openExternal;
   final ShareMedia share;
   final Widget? testVideoSurface;
+  final bool? shuffle;
 
   const AndroidMediaPage({
     super.key,
@@ -277,6 +279,7 @@ class AndroidMediaPage extends StatefulWidget {
     this.index = 0,
     this.video = false,
     this.oldPositions = const {},
+    this.shuffle,
     required this.openExternal,
     required this.share,
     this.testVideoSurface,
@@ -309,7 +312,7 @@ class _AndroidMediaPageState extends State<AndroidMediaPage> {
       if (paths != null) {
         unawaited(
           playback.open(paths, widget.index, widget.video, widget.oldPositions,
-              page: _token),
+              page: _token, shuffle: widget.shuffle),
         );
       } else if (playback.state.path == null &&
           playback.state.lastMusic != null) {
