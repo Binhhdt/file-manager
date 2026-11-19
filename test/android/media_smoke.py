@@ -158,7 +158,9 @@ with tempfile.TemporaryDirectory(prefix="fm-media-smoke-") as temp:
     try:
         folder = Path(temp)
         fixtures(folder)
-        adb("install", "-r", "-g", os.environ["FM_SMOKE_APK"])
+        if os.environ.get("FM_SMOKE_ALREADY_INSTALLED") != "true":
+            run("adb", "install", "-r", "-g", os.environ["FM_SMOKE_APK"], timeout=90)
+        adb("shell", "am", "force-stop", PACKAGE)
         if version >= 30:
             adb("shell", "appops", "set", "--uid", PACKAGE, "MANAGE_EXTERNAL_STORAGE", "allow")
         adb("shell", "mkdir", "-p", "/sdcard/Download")
