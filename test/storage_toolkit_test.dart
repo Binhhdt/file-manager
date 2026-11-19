@@ -41,6 +41,17 @@ class _CountingStorage extends Storage {
   }
 }
 
+class _FullBackupStorage extends Storage {
+  @override
+  Future<void> copyFile(String src, String dest,
+      {TransferProgress? progress}) async {
+    if (p.extension(src) != '.fmv')
+      return super.copyFile(src, dest, progress: progress);
+    await File(dest).writeAsBytes([0, 1, 2]);
+    throw const FileSystemException('Disk full', null, OSError('ENOSPC', 28));
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late Directory temp, data;
@@ -240,6 +251,16 @@ void main() {
     expect((await vault.list(_Progress())).$1.single.name, 'Hồ sơ 2026');
 
     final newRoot = Directory(p.join(temp.path, 'restored'));
+    final full = VaultStore(newRoot, _FullBackupStorage());
+    await expectLater(
+        full.restoreBackup(snapshot.path, originalPassword, _Progress()),
+        throwsA(isA<FileSystemException>()
+            .having((e) => e.osError?.errorCode, 'ENOSPC', 28)));
+    expect(await newRoot.exists(), isFalse);
+    expect(
+        await temp.list().any(
+            (node) => p.basename(node.path).startsWith('fm-vault-restore-')),
+        isFalse);
     final recovered = VaultStore(newRoot, storage);
     addTearDown(recovered.lock);
     final tag = File(p.join(snapshot.path, 'vault-backup.tag'));

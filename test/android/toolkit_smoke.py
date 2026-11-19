@@ -1,5 +1,6 @@
 """Exercise the signed APK with actual archives and PDF files on an emulator."""
 import binascii
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -49,30 +50,40 @@ def hierarchy():
     return list(ET.fromstring(adb("exec-out", "cat", "/data/local/tmp/fm-toolkit-ui.xml")).iter("node"))
 
 
-def node(label):
-    for item in hierarchy():
-        text = item.get("text", "") + " " + item.get("content-desc", "")
-        if (label in text and item.get("package") == PACKAGE
-                and not item.get("class", "").endswith("EditText")):
-            xy = list(map(int, re.findall(r"\d+", item.get("bounds", ""))))
-            if len(xy) == 4 and xy[2] > xy[0] and xy[3] > xy[1]:
-                return xy
+def bounds(item):
+    xy = list(map(int, re.findall(r"\d+", item.get("bounds", ""))))
+    if len(xy) == 4 and xy[2] > xy[0] and xy[3] > xy[1]:
+        return xy
     return None
 
 
-def tap(label):
-    x1, y1, x2, y2 = wait(label, lambda: node(label), seconds=45)
-    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+def node(label, *, exact=False, clickable=False):
+    for item in hierarchy():
+        text = (item.get("text", "") + " " + item.get("content-desc", "")).strip()
+        if ((text == label if exact else label in text) and item.get("package") == PACKAGE
+                and (not clickable or item.get("clickable") == "true")
+                and not item.get("class", "").endswith("EditText") and (xy := bounds(item))):
+            return xy
+    return None
+
+
+def tap(label, *, exact=False, clickable=False, hold=False):
+    x1, y1, x2, y2 = wait(label, lambda: node(label, exact=exact, clickable=clickable), seconds=45)
+    x, y = str((x1 + x2) // 2), str((y1 + y2) // 2)
+    if hold:
+        adb("shell", "input", "swipe", x, y, x, y, "850")
+    else:
+        adb("shell", "input", "tap", x, y)
     print(f"Tapped {label}", flush=True)
 
 
-def open_sample(filename):
+def open_sample(filename, *, hold=False):
     adb("shell", "am", "force-stop", PACKAGE)
     adb("shell", "am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity")
     tap("Tìm kiếm")
     adb("shell", "input", "text", filename)
     key("KEYCODE_ENTER")
-    tap(filename)
+    tap(filename, hold=hold)
 
 
 def fetch(url, *, uu=False):
@@ -131,6 +142,26 @@ def fixtures(folder):
     make_pdf(folder / "fmkit-document.pdf")
     shutil.copyfile(Path(__file__).with_name("fixtures") / "encrypted-two-pages.pdf",
                     folder / "fmkit-locked.pdf")
+    (folder / "fmkit-vault.txt").write_text("Verified private preview", encoding="utf-8")
+    digest = hashlib.sha256()
+    with zipfile.ZipFile(folder / "fmkit-large.zip", "w") as archive:
+        with archive.open("large.bin", "w") as member:
+            for index in range(24):
+                block = hashlib.shake_128(index.to_bytes(2, "big")).digest(1024 * 1024)
+                member.write(block)
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def enter_password_field(index, password):
+    def field():
+        fields = [xy for item in hierarchy() if item.get("package") == PACKAGE
+                  and item.get("class", "").endswith("EditText") and (xy := bounds(item))]
+        return fields[index] if len(fields) > index else None
+
+    x1, y1, x2, y2 = wait("vault password field", field)
+    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    adb("shell", "input", "text", password)
 
 
 def password(value):
@@ -185,7 +216,7 @@ def main():
     adb("shell", "mkdir", "-p", SAMPLES)
     with tempfile.TemporaryDirectory(prefix="fm-toolkit-smoke-") as path:
         folder = Path(path)
-        fixtures(folder)
+        digest = fixtures(folder)
         for item in folder.iterdir():
             adb("push", str(item), f"{SAMPLES}/{item.name}")
     for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
@@ -231,6 +262,30 @@ def main():
     tap("Mở")
     wait("encrypted PDF first page", lambda: node("1 / 2"))
     print("PASS PDF password prompt, wrong-password retry and opening", flush=True)
+
+    extract("fmkit-large.zip", "large.bin")
+    checksum = adb("shell", "sha256sum", f"{SAMPLES}/fmkit-large/large.bin").split()[0]
+    assert digest == checksum
+    print("PASS SHA-256 equality of 24 MiB archived fixture", flush=True)
+
+    open_sample("fmkit-vault.txt", hold=True)
+    tap("Show menu")
+    tap("Sao chép vào thư mục riêng tư")
+    tap("Tạo thư mục riêng tư", exact=True, clickable=True)
+    wait("vault password creation", lambda: node("Tạo mật khẩu riêng tư"))
+    enter_password_field(0, "SmokeVaultPassword123")
+    enter_password_field(1, "SmokeVaultPassword123")
+    tap("Tạo", exact=True, clickable=True)
+    tap("Nhập 1 bản sao", exact=True, clickable=True)
+    tap("Nhập bản sao", exact=True, clickable=True)
+    tap("fmkit-vault.txt")
+    wait("private preview", lambda: node("Verified private preview", exact=True))
+    assert adb("shell", "cat", f"{SAMPLES}/fmkit-vault.txt") == "Verified private preview"
+    key("KEYCODE_HOME")
+    adb("shell", "am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity")
+    wait("vault locked on return", lambda: node("Mở khóa", exact=True, clickable=True))
+    assert not node("Verified private preview", exact=True)
+    print("PASS vault creates encrypted copy, previews text and locks on Home", flush=True)
 
 
 if __name__ == "__main__":
