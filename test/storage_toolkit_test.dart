@@ -199,6 +199,92 @@ void main() {
     vault.lock();
   });
 
+  test(
+      'vault imports nested folders atomically and authenticates backup recovery',
+      () async {
+    const originalPassword = 'mật khẩu ban đầu';
+    const nextPassword = 'mật khẩu mới an toàn';
+    final source = await Directory(p.join(data.path, 'Hồ sơ 2026')).create();
+    final subdir = await Directory(p.join(source.path, 'Thư mục con')).create();
+    await Directory(p.join(subdir.path, 'rỗng')).create();
+    final original = await File(p.join(subdir.path, 'Tệp tiếng Việt.txt'))
+        .writeAsString('nội dung riêng tư');
+    final root = Directory(p.join(temp.path, 'vault'));
+    final vault = VaultStore(root, storage);
+    addTearDown(vault.lock);
+    await vault.unlock(originalPassword, create: true);
+    await expectLater(vault.importFile(source.path, _Progress(1)),
+        throwsA(isA<TransferCancelled>()));
+    expect(await root.list().map((node) => p.basename(node.path)).toList(),
+        ['vault.json']);
+    await vault.importFile(source.path, _Progress());
+    final (items, damaged) = await vault.list(_Progress());
+    expect(damaged, 0);
+    expect(items.single.name, 'Hồ sơ 2026');
+    final nested = (await vault.listFolder(items.single, _Progress())).single;
+    final children = await vault.listFolder(nested, _Progress());
+    final item = children.singleWhere((child) => !child.isDir);
+    expect(utf8.decode(await vault.preview(item, _Progress(), limit: 1024)),
+        'nội dung riêng tư');
+    expect(await original.readAsString(), 'nội dung riêng tư');
+    expect(await root.list(recursive: true).map((node) => node.path).toList(),
+        everyElement(isNot(contains('Thư mục con'))));
+
+    final snapshot = await Directory(p.join(temp.path, 'backup')).create();
+    await vault.backupTo(snapshot, _Progress());
+    await vault.changePassword(originalPassword, nextPassword, _Progress());
+    vault.lock();
+    await expectLater(vault.unlock(originalPassword, create: false),
+        throwsA(isA<FileSystemException>()));
+    await vault.unlock(nextPassword, create: false);
+    expect((await vault.list(_Progress())).$1.single.name, 'Hồ sơ 2026');
+
+    final newRoot = Directory(p.join(temp.path, 'restored'));
+    final recovered = VaultStore(newRoot, storage);
+    addTearDown(recovered.lock);
+    final tag = File(p.join(snapshot.path, 'vault-backup.tag'));
+    final checksum = await tag.readAsString();
+    await tag.writeAsString(
+        '${checksum[0] == 'A' ? 'B' : 'A'}${checksum.substring(1)}');
+    await expectLater(
+        recovered.restoreBackup(snapshot.path, originalPassword, _Progress()),
+        throwsFormatException);
+    expect(await newRoot.exists(), isFalse);
+    await tag.writeAsString(checksum);
+    await recovered.restoreBackup(snapshot.path, originalPassword, _Progress());
+    await recovered.unlock(originalPassword, create: false);
+    final (restored, _) = await recovered.list(_Progress());
+    final output = p.join(temp.path, 'output');
+    await recovered.exportTo(restored.single, output, _Progress());
+    expect(
+        await File(p.join(output, 'Thư mục con', 'Tệp tiếng Việt.txt'))
+            .readAsString(),
+        'nội dung riêng tư');
+    expect(await Directory(p.join(output, 'Thư mục con', 'rỗng')).exists(),
+        isTrue);
+    await expectLater(
+        recovered.restoreBackup(snapshot.path, originalPassword, _Progress()),
+        throwsA(isA<FileSystemException>()));
+  }, timeout: const Timeout(Duration(minutes: 2)));
+
+  test('vault removes interrupted staging without touching a completed object',
+      () async {
+    final root = await Directory(p.join(temp.path, 'vault')).create();
+    final vault = VaultStore(root, storage);
+    const id = 'aabbccdd0123456789abcdefabcd0123';
+    final part = await Directory(p.join(root.path, '$id.fmd.part')).create();
+    final complete =
+        await File(p.join(root.path, '$id.fmv')).writeAsString('existing');
+    final restore = await temp.createTemp('fm-vault-restore-');
+    final config = await File(p.join(root.path, 'vault.json.new'))
+        .writeAsString('incomplete');
+    await vault.cleanWrites();
+    expect(await part.exists(), isFalse);
+    expect(await restore.exists(), isFalse);
+    expect(await config.exists(), isFalse);
+    expect(await complete.readAsString(), 'existing');
+  });
+
   test('playlists persist ordered paths and apply a cyclic rename once',
       () async {
     SharedPreferences.setMockInitialValues({});

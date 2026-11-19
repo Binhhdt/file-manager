@@ -1744,7 +1744,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
               if (isArchive(path) && (Platform.isAndroid || !isSaf(path))) o(Icons.unarchive, 'Giải nén', () => _extract(path)),
               if (!isSaf(path)) o(Icons.archive, 'Nén thành zip', () => _zip([path])),
               o(Icons.edit, 'Đổi tên', () => _rename(it)),
-              if (Platform.isAndroid && it.e.isFile)
+              if (Platform.isAndroid && (it.e.isFile || it.isDir))
                 o(Icons.lock_outline, 'Sao chép vào thư mục riêng tư', () => _vaultFiles([path])),
               if (!it.isDir && catOf(path)?.name == 'Âm thanh')
                 o(Icons.playlist_add, 'Thêm vào playlist', () => addToPlaylist(context, [path])),
@@ -1991,7 +1991,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                         } else if (v == 'batchRename') {
                           _batchRename(filesForBatch);
                         } else if (v == 'vault') {
-                          _vaultFiles(filesForBatch);
+                          _vaultFiles(FileOperations.selection(picked));
                         } else if (v == 'playlist') {
                           addToPlaylist(context, picked);
                         } else if (v == 'info') {
@@ -2004,7 +2004,7 @@ class _BrowserState extends State<BrowserPage> with WidgetsBindingObserver {
                       },
                       itemBuilder: (_) => [
                         const PopupMenuItem(value: 'share', child: Text('Chia sẻ')),
-                        if (Platform.isAndroid && filesForBatch.isNotEmpty)
+                        if (Platform.isAndroid && picked.isNotEmpty)
                           const PopupMenuItem(value: 'vault', child: Text('Sao chép vào thư mục riêng tư')),
                         if (filesForBatch.length >= 2)
                           const PopupMenuItem(value: 'batchRename', child: Text('Đổi tên hàng loạt')),

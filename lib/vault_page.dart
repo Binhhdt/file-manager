@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
@@ -25,6 +27,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   bool _busy = false;
   String? _notice;
   app.Job? _job;
+  final _folders = <VaultItem>[];
+  VaultItem? _previewItem;
+  ui.Image? _previewImage;
+  String? _previewText;
+  Timer? _idle;
 
   @override
   void initState() {
@@ -41,6 +48,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _screenProtection(false);
     _job?.cancelled = true;
+    _idle?.cancel();
+    _previewImage?.dispose();
     app.vault.lock();
     super.dispose();
   }
@@ -62,12 +71,31 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   void _lock() {
     _job?.cancelled = true;
+    _idle?.cancel();
     app.vault.lock();
     if (mounted)
       setState(() {
         _files = const [];
+        _folders.clear();
+        _clearPreview();
         _notice = null;
       });
+  }
+
+  void _touch() {
+    _idle?.cancel();
+    if (app.vault.unlocked && !_busy) {
+      _idle = Timer(const Duration(minutes: 3), _lock);
+    }
+  }
+
+  void _clearPreview() {
+    final image = _previewImage;
+    _previewImage = null;
+    _previewText = null;
+    _previewItem = null;
+    if (image != null)
+      WidgetsBinding.instance.addPostFrameCallback((_) => image.dispose());
   }
 
   Future<void> _unlock() async {
@@ -91,7 +119,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   }
 
   Future<void> _refresh(app.Job job) async {
-    final (files, damaged) = await app.vault.list(job);
+    final (files, damaged) = _folders.isEmpty
+        ? await app.vault.list(job)
+        : (await app.vault.listFolder(_folders.last, job), 0);
     job.check();
     if (mounted)
       setState(() {
@@ -103,6 +133,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   Future<void> _work(
       String title, Future<void> Function(app.Job) action) async {
     if (_busy || !mounted) return;
+    _idle?.cancel();
     setState(() {
       _busy = true;
       _notice = null;
@@ -117,6 +148,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     } finally {
       _job = null;
       if (mounted) setState(() => _busy = false);
+      if (mounted) _touch();
     }
   }
 
@@ -131,16 +163,19 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         !mounted) return;
     await _work('Đang mã hóa', (job) async {
       var total = 0;
+      var folder = false;
       for (final path in current) {
         job.check();
         try {
-          final size = (await app.storage.stat(path))?.size ?? 0;
+          final stat = await app.storage.stat(path);
+          folder |= stat?.isDir == true;
+          final size = stat?.size ?? 0;
           if (size > 0) total += size;
         } on Exception {
           // The import loop reports inaccessible paths individually.
         }
       }
-      job.start(total);
+      job.start(folder ? 0 : total);
       final successes = <String>{};
       final errors = <String>[];
       for (final path in current) {
@@ -158,7 +193,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() => _imports.removeWhere(successes.contains));
       if (app.vault.unlocked && !job.cancelled) await _refresh(job);
-      if (mounted)
+      if (mounted && app.vault.unlocked)
         setState(() =>
             _notice = 'Đã nhập ${successes.length}/${current.length} bản sao.'
                 '${job.cancelled ? ' Đã huỷ phần còn lại.' : ''}'
@@ -180,16 +215,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     await _work('Đang xuất bản sao', (job) async {
       final area = await Directory.systemTemp.createTemp('fm-vault-export-');
       try {
-        final temporary = File(p.join(area.path, item.name));
+        final temporary = p.join(area.path, 'payload');
         job.start(item.size);
-        await app.vault.decryptTo(item, temporary, job);
+        await app.vault.exportTo(item, temporary, job);
         job.check();
         final target = await app.storage.unique(destination, item.name);
         job.describe('Đang công bố bản sao…');
         job.start(item.size);
         await app.operations.exclusive(() => app.operations.execute([
-              TransferItem(
-                  temporary.path, target, false, false, false, storageId()),
+              TransferItem(temporary, target, false, false, false, storageId()),
             ], progress: job));
         app.catalog.markPath(target);
         if (mounted)
@@ -200,15 +234,192 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _folder(VaultItem? item) async {
+    await _work('Đang đọc thư mục', (job) async {
+      final next = [..._folders];
+      if (item == null) {
+        next.removeLast();
+      } else {
+        next.add(item);
+      }
+      final (files, damaged) = next.isEmpty
+          ? await app.vault.list(job)
+          : (await app.vault.listFolder(next.last, job), 0);
+      job.check();
+      if (mounted && app.vault.unlocked)
+        setState(() {
+          _folders
+            ..clear()
+            ..addAll(next);
+          _files = files;
+          if (damaged > 0) _notice = 'Không xác thực được $damaged mục.';
+        });
+    });
+  }
+
+  Future<void> _preview(VaultItem item) async {
+    final extension = p.extension(item.name).toLowerCase();
+    const images = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'};
+    const text = {'.txt', '.csv', '.md', '.log', '.json', '.xml'};
+    if (!images.contains(extension) && !text.contains(extension)) {
+      setState(() => _notice =
+          'Tập tin này có thể xuất bản sao để mở bằng ứng dụng phù hợp.');
+      return;
+    }
+    await _work('Đang xác thực bản xem trước', (job) async {
+      final bytes = await app.vault.preview(item, job,
+          limit: images.contains(extension) ? 8 * 1024 * 1024 : 256 * 1024);
+      ui.Image? image;
+      String? value;
+      try {
+        if (images.contains(extension)) {
+          final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+          ui.ImageDescriptor? descriptor;
+          try {
+            descriptor = await ui.ImageDescriptor.encoded(buffer);
+            final scale = (2048 /
+                    (descriptor.width > descriptor.height
+                        ? descriptor.width
+                        : descriptor.height))
+                .clamp(0.0, 1.0);
+            final codec = await descriptor.instantiateCodec(
+              targetWidth: (descriptor.width * scale).round().clamp(1, 2048),
+              targetHeight: (descriptor.height * scale).round().clamp(1, 2048),
+            );
+            try {
+              image = (await codec.getNextFrame()).image;
+            } finally {
+              codec.dispose();
+            }
+          } finally {
+            descriptor?.dispose();
+            buffer.dispose();
+          }
+        } else {
+          value = utf8.decode(bytes, allowMalformed: true);
+        }
+        job.check();
+        if (mounted && app.vault.unlocked)
+          setState(() {
+            _clearPreview();
+            _previewItem = item;
+            _previewImage = image;
+            _previewText = value;
+            image = null;
+          });
+      } finally {
+        bytes.fillRange(0, bytes.length, 0);
+        image?.dispose();
+      }
+    });
+  }
+
+  Future<void> _changePassword() async {
+    final old = await showDialog<String>(
+        context: context,
+        builder: (_) => const _VaultPassword(
+            create: false, title: 'Nhập mật khẩu hiện tại'));
+    if (old == null || !mounted || !app.vault.unlocked) return;
+    final next = await showDialog<String>(
+        context: context,
+        builder: (_) =>
+            const _VaultPassword(create: true, title: 'Nhập mật khẩu mới'));
+    if (next == null || !mounted || !app.vault.unlocked) return;
+    await _work('Đang đổi mật khẩu', (job) async {
+      await app.vault.changePassword(old, next, job);
+      if (mounted && app.vault.unlocked)
+        setState(() => _notice =
+            'Đã đổi mật khẩu. Bản sao kho đã tạo trước đây dùng mật khẩu tại thời điểm sao lưu.');
+    });
+  }
+
+  Future<void> _backup(bool restore) async {
+    final path = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => StorageDestination(
+              action: restore
+                  ? 'Phục hồi từ thư mục này'
+                  : 'Sao lưu bản mã tại đây'),
+        ));
+    if (path == null || !mounted) return;
+    if (restore) {
+      final password = await showDialog<String>(
+          context: context,
+          builder: (_) => const _VaultPassword(
+              create: false, title: 'Mật khẩu tại thời điểm sao lưu'));
+      if (password == null || !mounted) return;
+      await _work('Đang xác minh và phục hồi bản mã', (job) async {
+        await app.vault.restoreBackup(path, password, job);
+        if (mounted)
+          setState(() {
+            _configured = true;
+            _notice = 'Đã phục hồi. Hãy mở khóa bằng mật khẩu của bản sao.';
+          });
+      });
+    } else if (app.vault.unlocked) {
+      await _work('Đang sao lưu bản mã', (job) async {
+        final stage = await Directory.systemTemp.createTemp('fm-vault-export-');
+        try {
+          await app.vault.backupTo(stage, job);
+          final target = await app.storage.unique(path, 'Kho-rieng-tu-ma-hoa');
+          job.check();
+          await app.operations.exclusive(() => app.operations.execute([
+                TransferItem(
+                    stage.path, target, false, false, false, storageId()),
+              ], progress: job));
+          if (mounted && app.vault.unlocked)
+            setState(() => _notice =
+                'Đã sao lưu kho đã mã hóa vào ${storageDisplayPath(target)}');
+        } finally {
+          await stage.delete(recursive: true);
+        }
+      });
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('Thư mục riêng tư'), actions: [
-          if (app.vault.unlocked)
-            IconButton(
-                onPressed: _busy ? null : _lock,
-                tooltip: 'Khóa',
-                icon: const Icon(Icons.lock)),
-        ]),
+  Widget build(BuildContext context) => Listener(
+      onPointerDown: (_) => _touch(),
+      child: Scaffold(
+        appBar: AppBar(
+            title: Text(_previewItem?.name ??
+                (_folders.isEmpty ? 'Thư mục riêng tư' : _folders.last.name)),
+            actions: [
+              if (_previewItem != null || _folders.isNotEmpty)
+                IconButton(
+                    tooltip: _previewItem != null
+                        ? 'Đóng bản xem trước'
+                        : 'Lên thư mục cha',
+                    onPressed: _busy
+                        ? null
+                        : () {
+                            if (_previewItem != null) {
+                              setState(_clearPreview);
+                            } else {
+                              _folder(null);
+                            }
+                          },
+                    icon: const Icon(Icons.arrow_upward)),
+              if (app.vault.unlocked)
+                PopupMenuButton<String>(
+                    enabled: !_busy,
+                    onSelected: (action) => action == 'password'
+                        ? _changePassword()
+                        : _backup(false),
+                    itemBuilder: (_) => const [
+                          PopupMenuItem(
+                              value: 'password', child: Text('Đổi mật khẩu')),
+                          PopupMenuItem(
+                              value: 'backup',
+                              child: Text('Sao lưu kho đã mã hóa')),
+                        ]),
+              if (app.vault.unlocked)
+                IconButton(
+                    onPressed: _busy ? null : _lock,
+                    tooltip: 'Khóa',
+                    icon: const Icon(Icons.lock)),
+            ]),
         body: _configured == null
             ? const Center(child: CircularProgressIndicator())
             : Column(children: [
@@ -227,46 +438,74 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     leading: Icon(Icons.lock_outline),
                     title: Text('Bản sao riêng tư được mã hóa trên thiết bị'),
                     subtitle: Text(
-                        'Cần mật khẩu để đọc hoặc xuất tập tin. Hãy ghi nhớ mật khẩu.'),
+                        'Nếu mất mật khẩu, bạn có thể mất quyền truy cập dữ liệu, kể cả bản sao đã mã hóa.'),
                   ),
                   FilledButton(
                       onPressed: _busy ? null : _unlock,
                       child: Text(
                           _configured! ? 'Mở khóa' : 'Tạo thư mục riêng tư')),
+                  if (_configured == false)
+                    TextButton(
+                        onPressed: _busy ? null : () => _backup(true),
+                        child: const Text('Phục hồi kho đã mã hóa')),
                 ] else ...[
-                  if (_imports.isNotEmpty)
+                  if (_imports.isNotEmpty &&
+                      _previewItem == null &&
+                      _folders.isEmpty)
                     FilledButton(
                         onPressed: _busy ? null : _import,
                         child: Text('Nhập ${_imports.length} bản sao')),
                   Expanded(
-                    child: _files.isEmpty
-                        ? const Center(child: Text('Chưa có tập tin riêng tư.'))
-                        : ListView.builder(
-                            itemCount: _files.length,
-                            itemBuilder: (_, index) {
-                              final item = _files[index];
-                              return ListTile(
-                                leading: const Icon(Icons.lock_outline),
-                                title: Text(item.name),
-                                subtitle: Text(app.fmtSize(item.size)),
-                                trailing: IconButton(
-                                  tooltip: 'Xuất bản sao',
-                                  onPressed: _busy ? null : () => _export(item),
-                                  icon:
-                                      const Icon(Icons.file_download_outlined),
-                                ),
-                              );
-                            },
-                          ),
+                    child: _previewItem != null
+                        ? (_previewImage != null
+                            ? Center(
+                                child: InteractiveViewer(
+                                    child: RawImage(
+                                        image: _previewImage,
+                                        fit: BoxFit.contain)))
+                            : SingleChildScrollView(
+                                padding: const EdgeInsets.all(16),
+                                child: Text(_previewText ?? '')))
+                        : _files.isEmpty
+                            ? const Center(
+                                child: Text('Chưa có tập tin riêng tư.'))
+                            : ListView.builder(
+                                itemCount: _files.length,
+                                itemBuilder: (_, index) {
+                                  final item = _files[index];
+                                  return ListTile(
+                                    leading: Icon(item.isDir
+                                        ? Icons.folder
+                                        : Icons.lock_outline),
+                                    title: Text(item.name),
+                                    subtitle: Text(item.isDir
+                                        ? '${item.children} mục · ${app.fmtSize(item.size)}'
+                                        : app.fmtSize(item.size)),
+                                    onTap: _busy
+                                        ? null
+                                        : () => item.isDir
+                                            ? _folder(item)
+                                            : _preview(item),
+                                    trailing: IconButton(
+                                      tooltip: 'Xuất bản sao',
+                                      onPressed:
+                                          _busy ? null : () => _export(item),
+                                      icon: const Icon(
+                                          Icons.file_download_outlined),
+                                    ),
+                                  );
+                                },
+                              ),
                   ),
                 ],
               ]),
-      );
+      ));
 }
 
 class _VaultPassword extends StatefulWidget {
   final bool create;
-  const _VaultPassword({required this.create});
+  final String? title;
+  const _VaultPassword({required this.create, this.title});
   @override
   State<_VaultPassword> createState() => _VaultPasswordState();
 }
@@ -297,13 +536,15 @@ class _VaultPasswordState extends State<_VaultPassword> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-        title:
-            Text(widget.create ? 'Tạo mật khẩu riêng tư' : 'Mở khóa thư mục'),
+        title: Text(widget.title ??
+            (widget.create ? 'Tạo mật khẩu riêng tư' : 'Mở khóa thư mục')),
         scrollable: true,
         content: Column(mainAxisSize: MainAxisSize.min, children: [
           TextField(
             controller: _pass,
             obscureText: _hidden,
+            enableSuggestions: false,
+            autocorrect: false,
             autofocus: true,
             decoration: InputDecoration(
               labelText: 'Mật khẩu',
@@ -322,6 +563,8 @@ class _VaultPasswordState extends State<_VaultPassword> {
             TextField(
               controller: _confirm,
               obscureText: _hidden,
+              enableSuggestions: false,
+              autocorrect: false,
               decoration: const InputDecoration(labelText: 'Xác nhận mật khẩu'),
               onSubmitted: (_) => _submit(),
             ),
