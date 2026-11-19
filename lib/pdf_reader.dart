@@ -255,9 +255,14 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
               calculateInitialPageNumber: (document, _) => _initial.clamp(
                   1, document.pages.isEmpty ? 1 : document.pages.length),
               onViewerReady: (document, controller) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) setState(() => _pages = document.pages.length);
+                if (!mounted || document.pages.isEmpty) return;
+                final initial = controller.pageNumber ??
+                    _initial.clamp(1, document.pages.length);
+                setState(() {
+                  _pages = document.pages.length;
+                  _page = initial;
                 });
+                unawaited(app.prefs.setInt('$_key.page', initial));
               },
               onPageChanged: _changed,
               pagePaintCallbacks: [_search.pageTextMatchPaintCallback],
@@ -268,9 +273,15 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                     loop: true, zoomCenter: details.localPosition));
                 return true;
               },
+              loadingBannerBuilder: (_, __, ___) => const Center(
+                child: CircularProgressIndicator(semanticsLabel: 'Đang mở PDF'),
+              ),
               errorBannerBuilder: (_, error, __, ___) => Center(
-                child: Text(
-                    'Không mở được PDF. Tài liệu có thể bị lỗi hoặc cần mật khẩu hợp lệ.'),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text('Không mở được PDF. ${storageError(error)}',
+                      textAlign: TextAlign.center),
+                ),
               ),
             ),
           )),

@@ -153,6 +153,9 @@ class _ArchivePageState extends State<_ArchivePage> {
             '${detail == null || detail.isEmpty ? '' : ' $detail'}';
       }
       if (error.code == 'password') return 'Cần mật khẩu hợp lệ.';
+      if (detail?.contains('Checksum verification failed') == true) {
+        return 'Không xác minh được nội dung giải nén. Kiểm tra tập tin hoặc mật khẩu.';
+      }
     }
     return storageError(error);
   }
