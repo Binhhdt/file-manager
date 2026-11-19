@@ -218,4 +218,29 @@ void main() {
     second.dispose();
     playback.dispose();
   });
+
+  test(
+      'playlist backup appends ordered SAF references and relinks missing tracks',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final preferences = await SharedPreferences.getInstance();
+    final playback = MediaPlayback();
+    final playlists = PlaylistStore(preferences, playback);
+    addTearDown(playback.dispose);
+    addTearDown(playlists.dispose);
+    final id = await playlists.create('Nhạc tiếng Việt');
+    final tree = Uri.encodeComponent(
+        'content://com.android.externalstorage.documents/tree/1234:Music');
+    final remote = '/@saf/$tree/đã chuyển.mp3';
+    await playlists.add(id, ['/nhạc cũ.mp3', remote]);
+    expect(await playlists.restore(playlists.backup()), 1);
+    final imported = playlists.lists.last;
+    expect(imported.name, 'Nhạc tiếng Việt');
+    expect(imported.id, isNot(id));
+    expect(imported.songs, ['/nhạc cũ.mp3', remote]);
+    await playlists.replaceTrack(imported.id, '/nhạc cũ.mp3', remote);
+    expect(playlists.find(imported.id)!.songs, [remote]);
+    await expectLater(playlists.restore('[]'), throwsFormatException);
+    expect(playlists.lists, hasLength(2));
+  });
 }

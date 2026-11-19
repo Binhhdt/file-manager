@@ -416,7 +416,9 @@ class _ArchivePageState extends State<_ArchivePage> {
 class StorageDestination extends StatefulWidget {
   final String? origin;
   final String action;
-  const StorageDestination({super.key, this.origin, required this.action});
+  final bool Function(StorageEntry)? fileFilter;
+  const StorageDestination(
+      {super.key, this.origin, required this.action, this.fileFilter});
   @override
   State<StorageDestination> createState() => _DestinationState();
 }
@@ -444,9 +446,13 @@ class _DestinationState extends State<StorageDestination> {
       final children = await app.catalog.refresh(path, priority: true);
       if (!mounted || token != _request) return;
       setState(() => _dirs = children
-          .where((file) => file.isDir && !excludedFromTools(file.path))
+          .where((file) =>
+              !excludedFromTools(file.path) &&
+              (file.isDir || (widget.fileFilter?.call(file) ?? false)))
           .toList()
-        ..sort((a, b) => a.path.compareTo(b.path)));
+        ..sort((a, b) => a.isDir == b.isDir
+            ? a.path.compareTo(b.path)
+            : (a.isDir ? -1 : 1)));
     } catch (error) {
       if (mounted && token == _request)
         setState(() => _error = storageError(error));
@@ -463,13 +469,15 @@ class _DestinationState extends State<StorageDestination> {
       for (final root in app.volumeRoots) root.path,
     };
     return Scaffold(
-      appBar: AppBar(title: const Text('Chọn thư mục đích')),
+      appBar: AppBar(
+          title: Text(
+              widget.fileFilter == null ? 'Chọn thư mục đích' : widget.action)),
       body: _path == null
           ? ListView(children: [
               for (final root in roots)
                 ListTile(
                     title: Text(storageDisplayPath(root)),
-                    subtitle: root == widget.origin
+                    subtitle: root == widget.origin && widget.fileFilter == null
                         ? const Text('Thư mục chứa tập tin nén')
                         : null,
                     leading: const Icon(Icons.folder),
@@ -492,23 +500,34 @@ class _DestinationState extends State<StorageDestination> {
                   child: ListView.builder(
                 itemCount: _dirs.length,
                 itemBuilder: (_, index) => ListTile(
-                  leading: const Icon(Icons.folder),
+                  leading: Icon(_dirs[index].isDir
+                      ? Icons.folder
+                      : Icons.insert_drive_file_outlined),
                   title: Text(p.basename(_dirs[index].path)),
-                  onTap: () => _open(_dirs[index].path),
+                  onTap: () {
+                    final item = _dirs[index];
+                    if (item.isDir) {
+                      _open(item.path);
+                    } else {
+                      Navigator.pop(context, item.path);
+                    }
+                  },
                 ),
               )),
             ]),
-      bottomNavigationBar: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: FilledButton(
-            onPressed: _path == null || _loading || _error != null
-                ? null
-                : () => Navigator.pop(context, _path),
-            child: Text(widget.action),
-          ),
-        ),
-      ),
+      bottomNavigationBar: widget.fileFilter != null
+          ? null
+          : SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: FilledButton(
+                  onPressed: _path == null || _loading || _error != null
+                      ? null
+                      : () => Navigator.pop(context, _path),
+                  child: Text(widget.action),
+                ),
+              ),
+            ),
     );
   }
 }

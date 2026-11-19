@@ -6,10 +6,15 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'archive_browser.dart';
 import 'file_operations.dart';
 import 'main.dart' as app;
 import 'media_player.dart';
 import 'storage.dart';
+import 'storage_tools.dart';
+
+const playlistBackupExtension = '.fmplaylist';
+const _backupLimit = 4 * 1024 * 1024;
 
 class SavedPlaylist {
   final String id, name;
@@ -101,6 +106,75 @@ class PlaylistStore extends ChangeNotifier {
   Future<void> setActive(String id) =>
       _change(() => _save(_lists, active: id, rename: _appliedRename));
 
+  String backup() {
+    final data = jsonEncode({
+      'format': 'file-manager-playlists',
+      'version': 1,
+      'playlists': _lists,
+    });
+    if (utf8.encode(data).length > _backupLimit) {
+      throw const FormatException('Bản sao playlist vượt quá 4 MiB');
+    }
+    return data;
+  }
+
+  Future<int> restore(String data) async {
+    if (utf8.encode(data).length > _backupLimit) {
+      throw const FormatException('Bản sao playlist vượt quá 4 MiB');
+    }
+    final decoded = jsonDecode(data);
+    if (decoded is! Map ||
+        decoded['format'] != 'file-manager-playlists' ||
+        decoded['version'] != 1 ||
+        decoded['playlists'] is! List) {
+      throw const FormatException('Bản sao playlist không hợp lệ');
+    }
+    final imported = <SavedPlaylist>[];
+    for (final row in decoded['playlists'] as List) {
+      if (row is! Map || row['name'] is! String || row['songs'] is! List) {
+        throw const FormatException('Mục playlist không hợp lệ');
+      }
+      final name = (row['name'] as String).trim();
+      final songs = <String>{};
+      for (final path in row['songs'] as List) {
+        if (path is! String ||
+            !p.isAbsolute(path) ||
+            p.normalize(path) != path ||
+            path.contains('\u0000') ||
+            excludedFromTools(path) ||
+            p.split(path).contains('fm-vault') ||
+            app.catOf(path)?.name != 'Âm thanh') {
+          throw const FormatException('Đường dẫn bài hát không hợp lệ');
+        }
+        if (isSaf(path)) storageDisplayPath(path);
+        songs.add(path);
+      }
+      if (name.isEmpty || name.contains('\u0000')) {
+        throw const FormatException('Tên playlist không hợp lệ');
+      }
+      final last = row['last'];
+      imported.add(SavedPlaylist(storageId(), name, songs,
+          last is String && songs.contains(last) ? last : null));
+    }
+    await _change(() => _save([..._lists, ...imported],
+        active: _active, rename: _appliedRename));
+    return imported.length;
+  }
+
+  Future<void> replaceTrack(String id, String oldPath, String newPath) =>
+      edit(id, (item) {
+        if (!item.songs.contains(oldPath)) return item;
+        return SavedPlaylist(
+            id,
+            item.name,
+            {
+              for (final song in item.songs)
+                if (song != newPath || song == oldPath)
+                  song == oldPath ? newPath : song,
+            },
+            item.last == oldPath ? newPath : item.last);
+      });
+
   Future<void> applyRenames(String transaction, Map<String, String> oldToNew) =>
       _change(() async {
         if (_appliedRename == transaction) return;
@@ -186,6 +260,87 @@ Future<void> addToPlaylist(BuildContext context, List<String> paths) async {
 class PlaylistLibraryPage extends StatelessWidget {
   const PlaylistLibraryPage({super.key});
 
+  Future<void> _backup(BuildContext context, {required bool restore}) async {
+    final path = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => StorageDestination(
+            action: restore
+                ? 'Chọn bản sao playlist'
+                : 'Lưu bản sao playlist tại đây',
+            fileFilter: restore
+                ? (entry) =>
+                    entry.isFile && entry.path.endsWith(playlistBackupExtension)
+                : null,
+          ),
+        ));
+    if (path == null || !context.mounted) return;
+    if (!await app.confirm(
+            context,
+            restore ? 'Nhập playlist?' : 'Sao lưu playlist?',
+            restore
+                ? 'Các playlist trong bản sao sẽ được thêm vào danh sách hiện tại.'
+                : 'Bản sao chứa tên playlist và đường dẫn bài hát.',
+            restore ? 'Nhập' : 'Sao lưu') ||
+        !context.mounted) return;
+    final job = app.Job();
+    var message = '';
+    try {
+      await app.runJob(
+          context,
+          restore ? 'Đang nhập playlist' : 'Đang sao lưu playlist',
+          job, () async {
+        if (restore) {
+          final input = await app.storage.open(path);
+          final data = <int>[];
+          try {
+            for (;;) {
+              job.check();
+              final chunk = await input.read();
+              if (chunk.isEmpty) break;
+              if (data.length + chunk.length > _backupLimit) {
+                throw const FormatException('Bản sao playlist vượt quá 4 MiB');
+              }
+              data.addAll(chunk);
+            }
+          } finally {
+            await input.close();
+          }
+          job.check();
+          final count = await app.playlists.restore(utf8.decode(data));
+          message = 'Đã nhập $count playlist.';
+        } else {
+          final staging = await Directory.systemTemp.createTemp('fm-open-');
+          try {
+            final data = utf8.encode(app.playlists.backup());
+            final file =
+                File(p.join(staging.path, 'playlists$playlistBackupExtension'));
+            await file.writeAsBytes(data, flush: true);
+            final target =
+                await app.storage.unique(path, p.basename(file.path));
+            job.start(data.length);
+            await app.operations.exclusive(() => app.operations.execute([
+                  TransferItem(
+                      file.path, target, false, false, false, storageId()),
+                ], progress: job));
+            app.catalog.markPath(target);
+            message = 'Đã sao lưu vào ${storageDisplayPath(target)}';
+          } finally {
+            await staging.delete(recursive: true);
+          }
+        }
+      });
+    } on TransferCancelled {
+      message = 'Đã hủy.';
+    } catch (error) {
+      message = storageError(error);
+    }
+    if (context.mounted && message.isNotEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
   Future<void> _create(BuildContext context) async {
     final name = await app.prompt(context, 'Tên playlist', '');
     if (name == null || name.isEmpty || !context.mounted) return;
@@ -201,6 +356,13 @@ class PlaylistLibraryPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(title: const Text('Playlist nhạc'), actions: [
+          PopupMenuButton<bool>(
+            onSelected: (restore) => _backup(context, restore: restore),
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: false, child: Text('Sao lưu playlist')),
+              PopupMenuItem(value: true, child: Text('Nhập bản sao playlist')),
+            ],
+          ),
           IconButton(
               tooltip: 'Tạo playlist mới',
               icon: const Icon(Icons.add),
@@ -247,6 +409,29 @@ class _PlaylistPageState extends State<_PlaylistPage> {
   final _durations = <String, int>{};
   final _missing = <String>{};
   bool _busy = false;
+
+  Future<void> _locate(SavedPlaylist item, String oldPath) async {
+    final path = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => StorageDestination(
+            action: 'Tìm lại bài hát',
+            fileFilter: (entry) =>
+                entry.isFile && app.catOf(entry.path)?.name == 'Âm thanh',
+          ),
+        ));
+    if (path == null || !mounted) return;
+    try {
+      if ((await app.storage.stat(path))?.isFile != true) {
+        throw const FileSystemException('Không đọc được bài hát đã chọn');
+      }
+      await app.playlists.replaceTrack(item.id, oldPath, path);
+      if (mounted) setState(() => _missing.remove(oldPath));
+      if (mounted) unawaited(_metadata());
+    } catch (error) {
+      _error(error);
+    }
+  }
 
   @override
   void initState() {
@@ -425,25 +610,40 @@ class _PlaylistPageState extends State<_PlaylistPage> {
                               '${_missing.contains(path) ? ' · Không truy cập được' : ''}'),
                           onTap: _busy
                               ? null
-                              : () => _play(item, start: path, shuffle: false),
-                          trailing: IconButton(
-                              tooltip: 'Bỏ khỏi playlist',
-                              icon: const Icon(Icons.remove_circle_outline),
-                              onPressed: () async {
-                                try {
-                                  await app.playlists.edit(
-                                      item.id,
-                                      (old) => SavedPlaylist(
-                                            old.id,
-                                            old.name,
-                                            old.songs
-                                                .where((song) => song != path),
-                                            old.last == path ? null : old.last,
-                                          ));
-                                } catch (error) {
-                                  _error(error);
-                                }
-                              }),
+                              : _missing.contains(path)
+                                  ? () => _locate(item, path)
+                                  : () =>
+                                      _play(item, start: path, shuffle: false),
+                          trailing:
+                              Row(mainAxisSize: MainAxisSize.min, children: [
+                            if (_missing.contains(path))
+                              IconButton(
+                                tooltip: 'Tìm lại bài hát',
+                                onPressed:
+                                    _busy ? null : () => _locate(item, path),
+                                icon: const Icon(Icons.search),
+                              ),
+                            IconButton(
+                                tooltip: 'Bỏ khỏi playlist',
+                                icon: const Icon(Icons.remove_circle_outline),
+                                onPressed: () async {
+                                  try {
+                                    await app.playlists.edit(
+                                        item.id,
+                                        (old) => SavedPlaylist(
+                                              old.id,
+                                              old.name,
+                                              old.songs.where(
+                                                  (song) => song != path),
+                                              old.last == path
+                                                  ? null
+                                                  : old.last,
+                                            ));
+                                  } catch (error) {
+                                    _error(error);
+                                  }
+                                }),
+                          ]),
                         );
                       },
                     )),
