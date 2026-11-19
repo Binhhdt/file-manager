@@ -423,6 +423,4 @@ jobs:
           script: |
             set -e
             if [ "$FM_TOOLKIT_SMOKE" = "true" ]; then python3 -u test/android/toolkit_smoke.py; fi
-            if [ "$FM_MEDIA_SMOKE" = "true" ]; then
-              FM_SMOKE_ALREADY_INSTALLED="$FM_TOOLKIT_SMOKE" python3 -u test/android/media_smoke.py
-            fi
+            if [ "$FM_MEDIA_SMOKE" = "true" ]; then FM_SMOKE_ALREADY_INSTALLED="$FM_TOOLKIT_SMOKE" python3 -u test/android/media_smoke.py; fi
