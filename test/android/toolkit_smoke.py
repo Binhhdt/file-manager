@@ -207,6 +207,37 @@ def extract(filename, member, content=None, supplied=None, inspect_password=Fals
     print(f"PASS extracted {filename}", flush=True)
 
 
+def exercise_vault():
+    open_sample("fmkit-vault.txt", hold=True)
+    tap("Show menu")
+    tap("Sao chép vào thư mục riêng tư")
+    tap("Tạo thư mục riêng tư", exact=True, clickable=True)
+    wait("vault password creation", lambda: node("Tạo mật khẩu riêng tư"))
+    enter_password_field(0, "SmokeVaultPassword123")
+    enter_password_field(1, "SmokeVaultPassword123")
+    tap("Tạo", exact=True, clickable=True)
+    tap("Nhập 1 bản sao", exact=True, clickable=True)
+    tap("Nhập bản sao", exact=True, clickable=True)
+    tap("fmkit-vault.txt")
+    wait("private preview", lambda: node("Verified private preview", exact=True))
+    assert adb("shell", "cat", f"{SAMPLES}/fmkit-vault.txt") == "Verified private preview"
+    key("KEYCODE_HOME")
+    adb("shell", "am", "start", "-W", "-a", "android.settings.SETTINGS")
+    wait("Settings in the foreground", lambda: any(
+        item.get("package") == "com.android.settings" for item in hierarchy()
+    ))
+    adb("shell", "am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity")
+    wait("vault locked on return", lambda: node("Mở khóa", exact=True, clickable=True))
+    assert not node("Verified private preview", exact=True)
+    tap("Mở khóa", exact=True, clickable=True)
+    wait("vault unlock dialog", lambda: node("Mở khóa thư mục"))
+    enter_password_field(0, "SmokeVaultPassword123")
+    tap("Mở khóa", exact=True, clickable=True)
+    tap("fmkit-vault.txt")
+    wait("private preview after unlock", lambda: node("Verified private preview", exact=True))
+    print("PASS vault roundtrip, private preview, lock on backgrounding and unlock with Android Keystore", flush=True)
+
+
 def main():
     api = int(adb("shell", "getprop", "ro.build.version.sdk").strip())
     print(f"Testing toolkit on Android Emulator API {api}", flush=True)
@@ -226,6 +257,7 @@ def main():
     key("KEYCODE_WAKEUP")
     key("KEYCODE_MENU")
 
+    exercise_vault()
     extract("fmkit-zip.zip", "nested/keep.txt", "zip fixture", select=True)
     extract("fmkit-tar.tgz", "target.txt", "tar fixture")
     extract("fmkit-rar4.rar", "testdir/test.txt", "test text file")
@@ -271,31 +303,6 @@ def main():
             checksum = hashlib.file_digest(stream, "sha256").hexdigest()
     assert digest == checksum
     print("PASS SHA-256 equality of 24 MiB archived fixture", flush=True)
-
-    open_sample("fmkit-vault.txt", hold=True)
-    tap("Show menu")
-    tap("Sao chép vào thư mục riêng tư")
-    tap("Tạo thư mục riêng tư", exact=True, clickable=True)
-    wait("vault password creation", lambda: node("Tạo mật khẩu riêng tư"))
-    enter_password_field(0, "SmokeVaultPassword123")
-    enter_password_field(1, "SmokeVaultPassword123")
-    tap("Tạo", exact=True, clickable=True)
-    tap("Nhập 1 bản sao", exact=True, clickable=True)
-    tap("Nhập bản sao", exact=True, clickable=True)
-    tap("fmkit-vault.txt")
-    wait("private preview", lambda: node("Verified private preview", exact=True))
-    assert adb("shell", "cat", f"{SAMPLES}/fmkit-vault.txt") == "Verified private preview"
-    key("KEYCODE_HOME")
-    adb("shell", "am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity")
-    wait("vault locked on return", lambda: node("Mở khóa", exact=True, clickable=True))
-    assert not node("Verified private preview", exact=True)
-    tap("Mở khóa", exact=True, clickable=True)
-    wait("vault unlock dialog", lambda: node("Mở khóa thư mục"))
-    enter_password_field(0, "SmokeVaultPassword123")
-    tap("Mở khóa", exact=True, clickable=True)
-    tap("fmkit-vault.txt")
-    wait("private preview after unlock", lambda: node("Verified private preview", exact=True))
-    print("PASS vault roundtrip, private preview, lock on Home and unlock with Android Keystore", flush=True)
 
 
 if __name__ == "__main__":
